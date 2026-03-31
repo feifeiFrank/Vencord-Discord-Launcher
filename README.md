@@ -9,7 +9,7 @@ Keywords: Vencord, Discord, install Vencord, start Discord, macOS, Windows, port
 - Run Vencord against the official Discord desktop app
 - Rebuild from upstream sources instead of shipping your personal paths
 - Generate a portable macOS `.app` bundle for sharing
-- Provide a Windows launcher script that installs Vencord and then starts Discord
+- Provide a Windows launcher script that installs or updates Vencord and then starts Discord
 
 ## Search-friendly summary
 
@@ -49,10 +49,8 @@ It is especially useful if you were searching for terms like:
 
 - Windows
 - Official Discord desktop app installed
-- `git`
-- `node`
-- `pnpm`
-- `go`
+- PowerShell
+- Internet access to download the official `VencordInstallerCli.exe`
 
 ## First run
 
@@ -70,17 +68,22 @@ It is especially useful if you were searching for terms like:
 ### Windows
 
 1. Clone this repo anywhere outside OneDrive or cloud-sync folders.
-2. Double-click [`windows/run.cmd`](./windows/run.cmd).
-3. If Windows asks for permission, allow it and retry if needed.
+2. Double-click [`windows/run.vbs`](./windows/run.vbs) for the app-like launcher, or [`windows/run.cmd`](./windows/run.cmd) if you want to see logs in a terminal.
+3. The launcher downloads the official `VencordInstallerCli.exe` on first run.
+4. If Windows asks for permission, allow it and retry if needed.
+
+### Windows single-file share
+
+- Use [`windows/VencordLauncher.cmd`](./windows/VencordLauncher.cmd) if you want one file you can send to other people.
+- The single-file launcher still downloads the official `VencordInstallerCli.exe` on first run.
+- It stores the downloaded CLI under `%LOCALAPPDATA%\DiscordWithVencordPortable\cache`.
 
 ## What the launchers do
 
-1. Clones or updates `Vencord`
-2. Clones or updates `Vencord/Installer`
-3. Builds Vencord desktop assets
-4. Builds the Installer CLI
-5. Re-patches Discord to load the freshly built `patcher.js`
-6. Launches Discord
+1. Finds the installed official Discord desktop app
+2. Downloads the latest official `VencordInstallerCli.exe` if needed
+3. Runs the Vencord installer CLI against Discord
+4. Launches Discord
 
 ## Build a share bundle
 
@@ -115,6 +118,9 @@ git push -u origin main
 - If macOS blocks writes to `/Applications/Discord.app`, grant the terminal app the relevant permission and retry
 - The generated share app is not a zero-setup installer; recipients may still need to approve permissions on their own Mac
 - On Windows, use the official desktop Discord app and rerun `windows/run.cmd` after Discord updates
+- On Windows, installer logs are written to `%TEMP%\vencord-portable-install.log`
+- On Windows, [`windows/run.vbs`](./windows/run.vbs) runs the launcher without leaving a terminal window open
+- On Windows, [`windows/VencordLauncher.cmd`](./windows/VencordLauncher.cmd) is the portable single-file option
 
 ## Windows note
 

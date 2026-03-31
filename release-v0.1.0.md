@@ -10,13 +10,14 @@ This is the first packaged release for the portable launcher project.
 ## What it does
 
 - Re-patches the official Discord app with Vencord before launch
-- Uses bundled Vencord build output and bundled Installer CLI
-- Launches `/Applications/Discord.app` after patching
+- On macOS, uses bundled Vencord build output and bundled Installer CLI
+- On Windows, ships a single-file launcher that downloads the official Installer CLI on first run
+- Launches Discord after patching
 
 ## Requirements
 
 - macOS or Windows
-- Discord installed at `/Applications/Discord.app`
+- Discord installed locally
 - Apple Silicon (`arm64`) Mac for the macOS app bundle
 - Official Discord desktop app for Windows when using the Windows package
 
@@ -25,10 +26,12 @@ This is the first packaged release for the portable launcher project.
 - This is not a zero-setup installer
 - macOS may ask for permission before the app can modify `/Applications/Discord.app`
 - If the app is blocked, the user may need to allow the app or their terminal-equivalent app to manage app bundles
-- On Windows, the launcher script expects `git`, `node`, `pnpm`, and `go` to be installed
+- On Windows, the release contains a single launcher file
+- On Windows, the launcher downloads the official `VencordInstallerCli.exe` on first run
 - This release does not include Discord itself
 
 ## Troubleshooting
 
 - If patching fails, check `/tmp/vencord-portable-install.log`
 - If Discord updates and Vencord disappears, run the app again
+- On Windows, the log file is `%TEMP%\vencord-portable-install.log`
