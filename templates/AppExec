@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -euo pipefail
+
+APP_EXEC_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_CONTENTS_DIR="$(cd "$APP_EXEC_DIR/.." && pwd)"
+
+exec "$APP_CONTENTS_DIR/Resources/portable-launcher.sh"
