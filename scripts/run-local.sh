@@ -1,19 +1,20 @@
 #!/bin/zsh
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE_DIR="$ROOT_DIR/.cache"
 SRC_DIR="$CACHE_DIR/src"
 BUILD_DIR="$CACHE_DIR/build"
-RUNTIME_DIR="$HOME/Library/Application Support/DiscordWithVencordPortable"
-
-VENCORD_REPO="$SRC_DIR/Vencord"
-INSTALLER_REPO="$SRC_DIR/Installer"
-INSTALLER_CLI="$BUILD_DIR/vencord-installer-cli"
-PATCHER_JS="$BUILD_DIR/Vencord/dist/patcher.js"
+VENCORD_DATA_DIR="$HOME/Library/Application Support/Vencord"
+VENCORD_DIST_DIR="$VENCORD_DATA_DIR/dist"
 LOG_FILE="/tmp/vencord-portable-install.log"
 
+INSTALLER_REPO="$SRC_DIR/Installer"
+INSTALLER_CLI="$BUILD_DIR/vencord-installer-cli"
 DISCORD_APP="/Applications/Discord.app"
+DISCORD_RESOURCES="$DISCORD_APP/Contents/Resources"
 
 info() {
     printf '[info] %s\n' "$1"
@@ -37,9 +38,12 @@ clone_or_update() {
     fi
 }
 
+is_discord_patched() {
+    [[ -f "$DISCORD_RESOURCES/app.asar" && -f "$DISCORD_RESOURCES/_app.asar" ]] || return 1
+    grep -Fq "$VENCORD_DIST_DIR/patcher.js" "$DISCORD_RESOURCES/app.asar"
+}
+
 need_cmd git
-need_cmd node
-need_cmd pnpm
 need_cmd go
 
 [[ -d "$DISCORD_APP" ]] || {
@@ -47,23 +51,10 @@ need_cmd go
     exit 1
 }
 
-mkdir -p "$SRC_DIR" "$BUILD_DIR" "$RUNTIME_DIR"
+mkdir -p "$SRC_DIR" "$BUILD_DIR" "$VENCORD_DATA_DIR"
 
-info "Updating Vencord sources"
-clone_or_update "https://github.com/Vendicated/Vencord.git" "$VENCORD_REPO"
 info "Updating Installer sources"
 clone_or_update "https://github.com/Vencord/Installer.git" "$INSTALLER_REPO"
-
-info "Installing Vencord dependencies"
-cd "$VENCORD_REPO"
-pnpm install
-
-info "Building Vencord desktop assets"
-pnpm build
-
-rm -rf "$BUILD_DIR/Vencord"
-mkdir -p "$BUILD_DIR/Vencord"
-cp -R "$VENCORD_REPO/dist" "$BUILD_DIR/Vencord/"
 
 info "Building Installer CLI"
 cd "$INSTALLER_REPO"
@@ -75,14 +66,17 @@ if pgrep -x "Discord" >/dev/null 2>&1; then
     pkill -x "Discord" >/dev/null 2>&1 || true
 fi
 
-info "Patching Discord"
+info "Updating Vencord and patching Discord"
 (
-    VENCORD_USER_DATA_DIR="$RUNTIME_DIR" \
-    VENCORD_DIRECTORY="$PATCHER_JS" \
-    VENCORD_DEV_INSTALL=1 \
-    "$INSTALLER_CLI" --install --branch stable
+    VENCORD_USER_DATA_DIR="$VENCORD_DATA_DIR" \
+    "$INSTALLER_CLI" --repair --branch stable
 ) >"$LOG_FILE" 2>&1 || {
     echo "Vencord install failed. See $LOG_FILE" >&2
+    exit 1
+}
+
+is_discord_patched || {
+    echo "Discord was not patched successfully. See $LOG_FILE" >&2
     exit 1
 }
 

@@ -7,12 +7,11 @@ DISCORD_APP="/Applications/Discord.app"
 CACHE_DIR="$HOME/Library/Caches/DiscordWithVencordPortable"
 SRC_DIR="$CACHE_DIR/src"
 BUILD_DIR="$CACHE_DIR/build"
-RUNTIME_DIR="$HOME/Library/Application Support/DiscordWithVencordPortable"
+VENCORD_DATA_DIR="$HOME/Library/Application Support/Vencord"
+VENCORD_DIST_DIR="$VENCORD_DATA_DIR/dist"
 LOG_FILE="/tmp/vencord-portable-install.log"
 
-VENCORD_REPO="$SRC_DIR/Vencord"
 INSTALLER_REPO="$SRC_DIR/Installer"
-PATCHER_JS="$VENCORD_REPO/dist/patcher.js"
 INSTALLER_CLI="$BUILD_DIR/vencord-installer-cli"
 DISCORD_RESOURCES="$DISCORD_APP/Contents/Resources"
 ADMIN_PATCH_SCRIPT="$BUILD_DIR/admin-patch.sh"
@@ -33,7 +32,7 @@ notify() {
 }
 
 show_failure_alert() {
-    osascript -e 'display alert "Vencord install failed" message "See /tmp/vencord-portable-install.log. Make sure git, node, pnpm, and go are installed. If macOS asks for administrator permission, approve it so Discord can be patched." as critical' >/dev/null 2>&1 || true
+    osascript -e 'display alert "Vencord install failed" message "See /tmp/vencord-portable-install.log. Make sure git and go are installed. If macOS asks for administrator permission, approve it so Discord can be patched." as critical' >/dev/null 2>&1 || true
 }
 
 clone_or_update() {
@@ -65,25 +64,27 @@ close_discord() {
 
 is_discord_patched() {
     [[ -f "$DISCORD_RESOURCES/app.asar" && -f "$DISCORD_RESOURCES/_app.asar" ]] || return 1
-    grep -Fq "$PATCHER_JS" "$DISCORD_RESOURCES/app.asar"
+    grep -Fq "$VENCORD_DIST_DIR/patcher.js" "$DISCORD_RESOURCES/app.asar"
 }
 
 run_patch() {
-    VENCORD_USER_DATA_DIR="$RUNTIME_DIR" \
-    VENCORD_DIRECTORY="$PATCHER_JS" \
-    VENCORD_DEV_INSTALL=1 \
-    "$INSTALLER_CLI" --install --branch stable
+    VENCORD_USER_DATA_DIR="$VENCORD_DATA_DIR" \
+    "$INSTALLER_CLI" --repair --branch stable
 }
 
 run_patch_with_admin() {
+    local user_name
+    local user_group
+    user_name="$(id -un)"
+    user_group="$(id -gn)"
+
     cat >"$ADMIN_PATCH_SCRIPT" <<EOF
 #!/bin/zsh
 set -euo pipefail
 
-VENCORD_USER_DATA_DIR="$RUNTIME_DIR" \\
-VENCORD_DIRECTORY="$PATCHER_JS" \\
-VENCORD_DEV_INSTALL=1 \\
-"$INSTALLER_CLI" --install --branch stable
+export VENCORD_USER_DATA_DIR="$VENCORD_DATA_DIR"
+"$INSTALLER_CLI" --repair --branch stable
+chown -R "$user_name:$user_group" "$VENCORD_DATA_DIR" >/dev/null 2>&1 || true
 EOF
 
     chmod +x "$ADMIN_PATCH_SCRIPT"
@@ -99,8 +100,6 @@ main() {
     info "Starting at $(date)"
 
     need_cmd git
-    need_cmd node
-    need_cmd pnpm
     need_cmd go
 
     [[ -d "$DISCORD_APP" ]] || {
@@ -108,24 +107,11 @@ main() {
         return 1
     }
 
-    mkdir -p "$SRC_DIR" "$BUILD_DIR" "$RUNTIME_DIR"
+    mkdir -p "$SRC_DIR" "$BUILD_DIR" "$VENCORD_DATA_DIR"
 
     notify
 
-    clone_or_update "https://github.com/Vendicated/Vencord.git" "$VENCORD_REPO" "Vencord"
     clone_or_update "https://github.com/Vencord/Installer.git" "$INSTALLER_REPO" "Vencord Installer"
-
-    info "Installing Vencord dependencies"
-    cd "$VENCORD_REPO"
-    pnpm install
-
-    info "Building Vencord desktop assets"
-    pnpm build
-
-    [[ -f "$PATCHER_JS" ]] || {
-        echo "Vencord build did not create $PATCHER_JS" >&2
-        return 1
-    }
 
     info "Building Installer CLI"
     cd "$INSTALLER_REPO"
@@ -138,7 +124,7 @@ main() {
 
     close_discord
 
-    info "Patching Discord"
+    info "Updating Vencord and patching Discord"
     run_patch || true
 
     if ! is_discord_patched; then
