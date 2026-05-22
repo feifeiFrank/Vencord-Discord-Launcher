@@ -49,8 +49,59 @@ is_discord_patched() {
     grep -Fq "$VENCORD_DIST_DIR/patcher.js" "$DISCORD_RESOURCES/app.asar"
 }
 
-need_cmd git
-need_cmd go
+is_vencord_wrapper() {
+    [[ -f "$DISCORD_RESOURCES/app.asar" ]] || return 1
+    grep -Fq "patcher.js" "$DISCORD_RESOURCES/app.asar"
+}
+
+download_vencord_dist() {
+    local download_base="https://github.com/Vendicated/Vencord/releases/latest/download"
+    local tmp_dir="$BUILD_DIR/vencord-dist-download"
+    local -a assets=(
+        patcher.js
+        patcher.js.map
+        patcher.js.LEGAL.txt
+        preload.js
+        preload.js.map
+        renderer.js
+        renderer.js.map
+        renderer.js.LEGAL.txt
+        renderer.css
+        renderer.css.map
+    )
+
+    rm -rf "$tmp_dir"
+    mkdir -p "$tmp_dir" "$VENCORD_DIST_DIR"
+
+    info "Downloading latest Vencord files"
+    for asset in "${assets[@]}"; do
+        if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 \
+            "$download_base/$asset" \
+            -o "$tmp_dir/$asset"; then
+            rm -rf "$tmp_dir"
+            if [[ -f "$VENCORD_DIST_DIR/patcher.js" ]]; then
+                info "Could not update Vencord files; using cached dist"
+                return 0
+            fi
+            echo "Could not download Vencord files and no cached dist exists" >&2
+            return 1
+        fi
+    done
+
+    printf '{}\n' >"$tmp_dir/package.json"
+    mv "$tmp_dir"/* "$VENCORD_DIST_DIR"/
+    rm -rf "$tmp_dir"
+}
+
+prepare_discord_for_patch() {
+    if [[ -f "$DISCORD_RESOURCES/_app.asar" ]] && ! is_vencord_wrapper; then
+        local stale_backup="$DISCORD_RESOURCES/_app.asar.stale.$(date +%Y%m%d%H%M%S)"
+        info "Moving stale _app.asar backup to $(basename "$stale_backup")"
+        mv "$DISCORD_RESOURCES/_app.asar" "$stale_backup"
+    fi
+}
+
+need_cmd curl
 
 [[ -d "$DISCORD_APP" ]] || {
     echo "Discord not found at $DISCORD_APP" >&2
@@ -59,27 +110,38 @@ need_cmd go
 
 mkdir -p "$SRC_DIR" "$BUILD_DIR" "$VENCORD_DATA_DIR"
 
-info "Updating Installer sources"
-checkout_installer_source "https://github.com/Vencord/Installer.git" "$INSTALLER_REPO"
+download_vencord_dist
 
-info "Building Installer CLI"
-cd "$INSTALLER_REPO"
-go build --tags cli -o "$INSTALLER_CLI"
+if ! is_discord_patched; then
+    need_cmd git
+    need_cmd go
 
-if pgrep -x "Discord" >/dev/null 2>&1; then
-    osascript -e 'tell application "Discord" to quit' >/dev/null 2>&1 || true
-    sleep 2
-    pkill -x "Discord" >/dev/null 2>&1 || true
+    info "Updating Installer sources"
+    checkout_installer_source "https://github.com/Vencord/Installer.git" "$INSTALLER_REPO"
+
+    info "Building Installer CLI"
+    cd "$INSTALLER_REPO"
+    go build --tags cli -o "$INSTALLER_CLI"
+
+    if pgrep -x "Discord" >/dev/null 2>&1; then
+        osascript -e 'tell application "Discord" to quit' >/dev/null 2>&1 || true
+        sleep 2
+        pkill -x "Discord" >/dev/null 2>&1 || true
+    fi
+
+    prepare_discord_for_patch
+
+    info "Patching Discord"
+    (
+        VENCORD_USER_DATA_DIR="$VENCORD_DATA_DIR" \
+        "$INSTALLER_CLI" --repair --branch stable
+    ) >"$LOG_FILE" 2>&1 || {
+        echo "Vencord install failed. See $LOG_FILE" >&2
+        exit 1
+    }
+else
+    info "Discord is already patched"
 fi
-
-info "Updating Vencord and patching Discord"
-(
-    VENCORD_USER_DATA_DIR="$VENCORD_DATA_DIR" \
-    "$INSTALLER_CLI" --repair --branch stable
-) >"$LOG_FILE" 2>&1 || {
-    echo "Vencord install failed. See $LOG_FILE" >&2
-    exit 1
-}
 
 is_discord_patched || {
     echo "Discord was not patched successfully. See $LOG_FILE" >&2

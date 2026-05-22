@@ -40,8 +40,8 @@ It is especially useful if you were searching for terms like:
 
 - macOS
 - Discord installed at `/Applications/Discord.app`
-- `git`
-- `go`
+- `curl`
+- `git` and `go` only for the first patch, or after Discord updates and needs to be patched again
 - Internet access for the first launch and for future Vencord updates
 - Homebrew installs in `/opt/homebrew` or `/usr/local` are detected when the macOS share app is opened from Finder
 
@@ -85,13 +85,15 @@ It is especially useful if you were searching for terms like:
 ### macOS
 
 1. Finds the installed official Discord desktop app
-2. Clones or updates the official Vencord Installer source code
-3. Checks out the official Vencord Installer release tag `v1.4.0`
-4. Builds the official Vencord Installer CLI locally
-5. Runs the Installer CLI in `repair` mode against Discord
-6. Lets the official Installer CLI download/update Vencord's release `dist` files under `~/Library/Application Support/Vencord/dist`
-7. Requests administrator permission if macOS blocks the normal patch attempt
-8. Verifies Discord was patched with the official Vencord data path before launching Discord
+2. Downloads the latest Vencord release `dist` files under `~/Library/Application Support/Vencord/dist`
+3. Checks whether Discord's `app.asar` wrapper already points at that Vencord dist path
+4. If Discord is already patched, starts Discord without modifying `/Applications/Discord.app`
+5. If Discord needs patching, clones or updates the official Vencord Installer source code
+6. Checks out the official Vencord Installer release tag `v1.4.0`
+7. Builds the official Vencord Installer CLI locally
+8. Runs the Installer CLI in `repair` mode against Discord
+9. Requests administrator permission if macOS blocks the normal patch attempt
+10. Verifies Discord was patched with the official Vencord data path before launching Discord
 
 The generated macOS share app follows the official Vencord Installer layout. It does not bundle a fixed `Vencord/dist` folder and it does not use a private dev-install path. This avoids the old problem where a stale bundled build or personal absolute path could stop working after Discord or Vencord changed.
 
@@ -103,7 +105,7 @@ After the first successful run, source code is cached under:
 ~/Library/Caches/DiscordWithVencordPortable
 ```
 
-If an update check fails later because the Mac is offline, the launcher tries to keep using the cached source.
+If the Vencord dist update fails later because the Mac is offline, the launcher keeps using the cached dist as long as `patcher.js` already exists.
 
 ### Windows
 
@@ -146,7 +148,8 @@ git push -u origin main
 ## Troubleshooting
 
 - If patching fails, check `/tmp/vencord-portable-install.log`
-- If the macOS share app fails on first run, check that `git` and `go` are installed and available in `PATH`
+- If the macOS share app fails on first run, check that `curl`, `git`, and `go` are installed and available in `PATH`
+- If Discord is already patched, later launches only need `curl`; `git` and `go` are only needed when Discord has to be patched again
 - If macOS asks for administrator permission during patching, approve it so the launcher can modify `/Applications/Discord.app`
 - If you want to force a clean macOS rebuild, delete `~/Library/Caches/DiscordWithVencordPortable` and run the app again
 - If Discord updates and Vencord disappears, run `run.command` or the generated macOS share app again
