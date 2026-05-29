@@ -122,21 +122,6 @@ The generated release zip is:
 ./output/Discord.with.Vencord.Portable.app.zip
 ```
 
-## Push to GitHub
-
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-```
-
-Then create a GitHub repo and connect it:
-
-```bash
-git remote add origin <your-repo-url>
-git push -u origin main
-```
-
 ## Troubleshooting
 
 - If patching fails, check `/tmp/vencord-portable-install.log`
