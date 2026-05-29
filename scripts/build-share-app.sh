@@ -7,16 +7,25 @@ APP_DIR="$OUTPUT_DIR/Discord with Vencord Portable.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
+APP_SOURCE="$ROOT_DIR/Sources/DiscordWithVencordPortable/main.m"
+CLANG="$(xcrun --find clang 2>/dev/null || command -v clang)"
+SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 
 rm -rf "$APP_DIR"
 mkdir -p "$RESOURCES_DIR" "$MACOS_DIR"
 
 cp "$ROOT_DIR/templates/Info.plist" "$CONTENTS_DIR/Info.plist"
-cp "$ROOT_DIR/templates/AppExec" "$MACOS_DIR/DiscordWithVencordPortable"
-chmod +x "$MACOS_DIR/DiscordWithVencordPortable"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CONTENTS_DIR/Info.plist")"
 
-cp "$ROOT_DIR/templates/portable-launcher.sh" "$RESOURCES_DIR/portable-launcher.sh"
-chmod +x "$RESOURCES_DIR/portable-launcher.sh"
+"$CLANG" \
+    -fobjc-arc \
+    -isysroot "$SDKROOT" \
+    -framework AppKit \
+    -framework Foundation \
+    "$APP_SOURCE" \
+    -o "$MACOS_DIR/DiscordWithVencordPortable"
+
+codesign --force --sign - --requirements "=designated => identifier \"$BUNDLE_ID\"" "$APP_DIR" >/dev/null
 
 cd "$OUTPUT_DIR"
 rm -f "Discord with Vencord Portable.app.zip" "Discord.with.Vencord.Portable.app.zip"

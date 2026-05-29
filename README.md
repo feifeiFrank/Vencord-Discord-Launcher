@@ -7,8 +7,7 @@ Keywords: Vencord, Discord, install Vencord, start Discord, macOS, Windows, port
 ## What this repo is for
 
 - Run Vencord against the official Discord desktop app
-- Build the official Vencord Installer CLI from the latest official release tag instead of shipping your personal paths
-- Generate a portable macOS `.app` bundle that refreshes Vencord before launch
+- Generate a native portable macOS `.app` bundle that refreshes Vencord before launch
 - Provide a Windows launcher script that installs or updates Vencord and then starts Discord
 
 ## Search-friendly summary
@@ -40,10 +39,8 @@ It is especially useful if you were searching for terms like:
 
 - macOS
 - Discord installed at `/Applications/Discord.app`
-- `curl`
-- `git` and `go` only for the first patch, or after Discord updates and needs to be patched again
 - Internet access for the first launch and for future Vencord updates
-- Homebrew installs in `/opt/homebrew` or `/usr/local` are detected when the macOS share app is opened from Finder
+- Apple Command Line Tools only if you build the macOS share app from source
 
 ### Windows
 
@@ -58,14 +55,13 @@ It is especially useful if you were searching for terms like:
 
 1. Clone this repo anywhere outside OneDrive or iCloud syncing folders.
 2. Double-click [`run.command`](./run.command).
-3. The first run may take a few minutes while it clones and builds the official Vencord Installer CLI release.
+3. The first run downloads the latest Vencord release files.
 4. If macOS says the app cannot be opened because Apple cannot verify it:
 5. Open `System Settings` -> `Privacy & Security`
 6. Scroll to the Security section
 7. Click `Open Anyway` for the blocked app
 8. Run the app again and confirm the second prompt if macOS asks again
-9. If macOS asks for administrator permission while patching Discord, approve it.
-10. If macOS still blocks writes to Discord, grant the terminal app or generated app the required permission and run again.
+9. If macOS blocks writes to Discord, grant the generated app `App Management` permission and run it again.
 
 ### Windows
 
@@ -88,21 +84,17 @@ It is especially useful if you were searching for terms like:
 2. Downloads the latest Vencord release `dist` files under `~/Library/Application Support/Vencord/dist`
 3. Checks whether Discord's `app.asar` wrapper already points at that Vencord dist path
 4. If Discord is already patched, starts Discord without modifying `/Applications/Discord.app`
-5. If Discord needs patching, clones or updates the official Vencord Installer source code
-6. Checks out the official Vencord Installer release tag `v1.4.0`
-7. Builds the official Vencord Installer CLI locally
-8. Runs the Installer CLI in `repair` mode against Discord
-9. Requests administrator permission if macOS blocks the normal patch attempt
-10. Verifies Discord was patched with the official Vencord data path before launching Discord
+5. If Discord needs patching, quits Discord, moves `app.asar` to `_app.asar`, and writes a small Vencord wrapper `app.asar`
+6. Verifies Discord was patched with the official Vencord data path before launching Discord
 
-The generated macOS share app follows the official Vencord Installer layout. It does not bundle a fixed `Vencord/dist` folder and it does not use a private dev-install path. This avoids the old problem where a stale bundled build or personal absolute path could stop working after Discord or Vencord changed.
+The generated macOS share app uses a native AppKit executable instead of a shell, Python, or AppleScript patch path. This keeps macOS App Management attribution on the launcher app itself.
 
-The launcher intentionally builds from the latest official Vencord Installer release tag instead of the upstream `main` branch. This avoids breakage when upstream development code is temporarily not buildable. Advanced users can override the tag with `VENCORD_INSTALLER_TAG`.
+The generated macOS share app follows the official Vencord Installer wrapper layout. It does not bundle a fixed `Vencord/dist` folder and it does not use a private dev-install path. This avoids the old problem where a stale bundled build or personal absolute path could stop working after Discord or Vencord changed.
 
-After the first successful run, source code is cached under:
+After the first successful run, Vencord release files are cached under:
 
 ```text
-~/Library/Caches/DiscordWithVencordPortable
+~/Library/Application Support/Vencord/dist
 ```
 
 If the Vencord dist update fails later because the Mac is offline, the launcher keeps using the cached dist as long as `patcher.js` already exists.
@@ -148,13 +140,12 @@ git push -u origin main
 ## Troubleshooting
 
 - If patching fails, check `/tmp/vencord-portable-install.log`
-- If the macOS share app fails on first run, check that `curl`, `git`, and `go` are installed and available in `PATH`
-- If Discord is already patched, later launches only need `curl`; `git` and `go` are only needed when Discord has to be patched again
-- If macOS asks for administrator permission during patching, approve it so the launcher can modify `/Applications/Discord.app`
+- If the macOS share app fails to build from source, check that Apple Command Line Tools are installed
+- If macOS blocks patching, open `System Settings` -> `Privacy & Security` -> `App Management` and enable `Discord with Vencord Portable`
 - If you want to force a clean macOS rebuild, delete `~/Library/Caches/DiscordWithVencordPortable` and run the app again
 - If Discord updates and Vencord disappears, run `run.command` or the generated macOS share app again
 - If macOS shows "Apple could not verify ... is free of malware", go to `System Settings` -> `Privacy & Security` and click `Open Anyway`
-- If macOS blocks writes to `/Applications/Discord.app`, grant the terminal app the relevant permission and retry
+- If macOS blocks writes to `/Applications/Discord.app`, grant the generated app `App Management` permission and retry
 - The generated share app is not a zero-setup installer; recipients may still need to approve permissions on their own Mac
 - On Windows, use the official desktop Discord app and rerun `windows/run.cmd` after Discord updates
 - On Windows, installer logs are written to `%TEMP%\vencord-portable-install.log`

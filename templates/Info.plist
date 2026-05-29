@@ -7,14 +7,20 @@
     <key>CFBundleExecutable</key>
     <string>DiscordWithVencordPortable</string>
     <key>CFBundleIdentifier</key>
-    <string>com.example.discord-with-vencord-portable</string>
+    <string>io.github.qiuyunfei.discord-with-vencord-portable</string>
     <key>CFBundleName</key>
     <string>Discord with Vencord Portable</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.2</string>
-    <key>CFBundleVersion</key>
-    <string>3</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3.0</string>
+	<key>CFBundleVersion</key>
+	<string>5</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSystemAdministrationUsageDescription</key>
+	<string>Discord with Vencord Portable needs to update Discord.app's app.asar wrapper so Vencord can load before Discord starts.</string>
 </dict>
 </plist>
