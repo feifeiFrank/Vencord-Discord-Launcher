@@ -1,47 +1,64 @@
 @echo off
-setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$source = Get-Content -LiteralPath '%~f0' -Raw; $marker = '# POWERSHELL-BEGIN'; $index = $source.LastIndexOf($marker); if ($index -lt 0) { throw 'Launcher payload missing.' }; $payload = $source.Substring($index + $marker.Length); $tmp = Join-Path $env:TEMP ('vencord-launcher-' + [guid]::NewGuid().ToString() + '.ps1'); Set-Content -LiteralPath $tmp -Value $payload -Encoding UTF8; try { & $tmp -Silent; exit $LASTEXITCODE } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }"
+setlocal DisableDelayedExpansion
+set "VENCORD_LAUNCHER_SOURCE=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$source = Get-Content -LiteralPath $env:VENCORD_LAUNCHER_SOURCE -Raw; $marker = '# POWERSHELL-BEGIN'; $index = $source.LastIndexOf($marker); if ($index -lt 0) { throw 'Launcher payload missing.' }; $payload = $source.Substring($index + $marker.Length); $tmp = Join-Path $env:TEMP ('vencord-launcher-' + [guid]::NewGuid().ToString() + '.ps1'); try { Set-Content -LiteralPath $tmp -Value $payload -Encoding UTF8; & $tmp -Silent -Standalone; exit $LASTEXITCODE } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }"
 exit /b %ERRORLEVEL%
 # POWERSHELL-BEGIN
 [CmdletBinding()]
 param(
     [switch]$ForceDownload,
-    [switch]$Silent
+    [switch]$Silent,
+    [switch]$Standalone
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$cacheDir = Join-Path $env:LOCALAPPDATA "DiscordWithVencordPortable\cache"
+$installerFileName = "VencordInstallerCli.exe"
+$checksumsFileName = "checksums.sha256"
+
+if ($Standalone) {
+    $cacheDir = Join-Path $env:LOCALAPPDATA "DiscordWithVencordPortable\cache"
+}
+else {
+    $rootDir = Split-Path -Parent $PSScriptRoot
+    $cacheDir = Join-Path $rootDir ".cache\windows"
+}
+
 $runtimeDir = Join-Path $env:APPDATA "DiscordWithVencordPortable"
-$installerCli = Join-Path $cacheDir "VencordInstallerCli.exe"
+$installerCli = Join-Path $cacheDir $installerFileName
+$checksumsFile = Join-Path $cacheDir $checksumsFileName
 $logFile = Join-Path $env:TEMP "vencord-portable-install.log"
-$downloadUrl = "https://github.com/Vencord/Installer/releases/latest/download/VencordInstallerCli.exe"
+$releaseDownloadUrl = "https://github.com/Vencord/Installer/releases/latest/download"
+$downloadUrl = "$releaseDownloadUrl/$installerFileName"
+$checksumsUrl = "$releaseDownloadUrl/$checksumsFileName"
 
 $discordLaunchers = @(
     @{
         Name = "Discord"
         Branch = "stable"
         UpdateExe = Join-Path $env:LOCALAPPDATA "Discord\Update.exe"
-        ProcessName = "Discord.exe"
+        ProcessName = "Discord"
+        ExecutableName = "Discord.exe"
     },
     @{
         Name = "Discord PTB"
         Branch = "ptb"
         UpdateExe = Join-Path $env:LOCALAPPDATA "DiscordPTB\Update.exe"
-        ProcessName = "DiscordPTB.exe"
+        ProcessName = "DiscordPTB"
+        ExecutableName = "DiscordPTB.exe"
     },
     @{
         Name = "Discord Canary"
         Branch = "canary"
         UpdateExe = Join-Path $env:LOCALAPPDATA "DiscordCanary\Update.exe"
-        ProcessName = "DiscordCanary.exe"
+        ProcessName = "DiscordCanary"
+        ExecutableName = "DiscordCanary.exe"
     }
 )
 
 function Write-Info {
     param([string]$Message)
-
     if (-not $Silent) {
         Write-Host "[info] $Message"
     }
@@ -100,28 +117,112 @@ function Stop-DiscordProcesses {
     Start-Sleep -Seconds 2
 }
 
+function Get-ExpectedInstallerHash {
+    param(
+        [string]$ChecksumsPath,
+        [string]$InstallerName
+    )
+
+    if (-not (Test-Path -LiteralPath $ChecksumsPath -PathType Leaf)) {
+        throw "Checksum file not found: $ChecksumsPath"
+    }
+
+    $expectedHashes = @()
+    $checksumPattern = '^(?<Hash>[0-9A-Fa-f]{64})[ \t]+\*?(?<Name>.+?)\s*$'
+
+    foreach ($line in Get-Content -LiteralPath $ChecksumsPath) {
+        $match = [regex]::Match($line, $checksumPattern)
+        if ($match.Success -and $match.Groups["Name"].Value.Trim() -ceq $InstallerName) {
+            $expectedHashes += $match.Groups["Hash"].Value.ToLowerInvariant()
+        }
+    }
+
+    if ($expectedHashes.Count -ne 1) {
+        throw "Expected exactly one SHA-256 entry for $InstallerName in $ChecksumsPath; found $($expectedHashes.Count)."
+    }
+
+    return $expectedHashes[0]
+}
+
+function Assert-InstallerChecksum {
+    param(
+        [string]$CliPath,
+        [string]$ChecksumsPath,
+        [string]$InstallerName
+    )
+
+    if (-not (Test-Path -LiteralPath $CliPath -PathType Leaf)) {
+        throw "Installer CLI not found: $CliPath"
+    }
+
+    $expectedHash = Get-ExpectedInstallerHash -ChecksumsPath $ChecksumsPath -InstallerName $InstallerName
+    $actualHash = (Get-FileHash -LiteralPath $CliPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    if (-not [string]::Equals($actualHash, $expectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SHA-256 verification failed for $InstallerName. Expected $expectedHash but got $actualHash."
+    }
+}
+
+function Test-InstallerChecksum {
+    param(
+        [string]$CliPath,
+        [string]$ChecksumsPath,
+        [string]$InstallerName
+    )
+
+    try {
+        Assert-InstallerChecksum -CliPath $CliPath -ChecksumsPath $ChecksumsPath -InstallerName $InstallerName
+        return $true
+    }
+    catch {
+        Write-Info "Cached installer verification failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Download-InstallerCli {
     param(
         [string]$Url,
-        [string]$Destination
+        [string]$ChecksumsUrl,
+        [string]$Destination,
+        [string]$ChecksumsDestination,
+        [string]$InstallerName
     )
 
-    $tmpFile = "$Destination.download"
-    if (Test-Path -LiteralPath $tmpFile) {
-        Remove-Item -LiteralPath $tmpFile -Force
-    }
+    $downloadId = [guid]::NewGuid().ToString("N")
+    $destinationDir = Split-Path -Parent $Destination
+    $tmpFile = Join-Path $destinationDir "$InstallerName.$downloadId.download"
+    $tmpChecksumsFile = Join-Path $destinationDir "checksums.$downloadId.download"
 
-    Write-Info "Downloading official Vencord Installer CLI"
-    Invoke-WebRequest -Uri $Url -OutFile $tmpFile
-    Move-Item -LiteralPath $tmpFile -Destination $Destination -Force
+    try {
+        Write-Info "Downloading official Vencord Installer CLI and SHA-256 checksums"
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $tmpFile
+        Invoke-WebRequest -UseBasicParsing -Uri $ChecksumsUrl -OutFile $tmpChecksumsFile
+
+        Assert-InstallerChecksum -CliPath $tmpFile -ChecksumsPath $tmpChecksumsFile -InstallerName $InstallerName
+
+        Move-Item -LiteralPath $tmpChecksumsFile -Destination $ChecksumsDestination -Force
+        Move-Item -LiteralPath $tmpFile -Destination $Destination -Force
+
+        Assert-InstallerChecksum -CliPath $Destination -ChecksumsPath $ChecksumsDestination -InstallerName $InstallerName
+        Write-Info "Verified $InstallerName with the official SHA-256 checksum"
+    }
+    finally {
+        Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmpChecksumsFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-InstallerCli {
     param(
         [string]$CliPath,
         [string]$Branch,
-        [string]$LogPath
+        [string]$LogPath,
+        [string]$ChecksumsPath,
+        [string]$InstallerName
     )
+
+    Assert-InstallerChecksum -CliPath $CliPath -ChecksumsPath $ChecksumsPath -InstallerName $InstallerName
 
     $stdoutPath = "$LogPath.stdout"
     $stderrPath = "$LogPath.stderr"
@@ -129,38 +230,41 @@ function Invoke-InstallerCli {
     Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
 
-    $process = Start-Process -FilePath $CliPath `
-        -ArgumentList "--install", "--branch", $Branch `
-        -NoNewWindow `
-        -Wait `
-        -PassThru `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath
+    try {
+        $process = Start-Process -FilePath $CliPath `
+            -ArgumentList "--install", "--branch", $Branch `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
 
-    $stdout = @()
-    $stderr = @()
+        $stdout = @()
+        $stderr = @()
 
-    if (Test-Path -LiteralPath $stdoutPath) {
-        $stdout = Get-Content -LiteralPath $stdoutPath
-    }
-
-    if (Test-Path -LiteralPath $stderrPath) {
-        $stderr = Get-Content -LiteralPath $stderrPath
-    }
-
-    $combined = @($stdout) + @($stderr)
-    Set-Content -LiteralPath $LogPath -Value $combined
-
-    if (-not $Silent) {
-        foreach ($line in $combined) {
-            Write-Host $line
+        if (Test-Path -LiteralPath $stdoutPath) {
+            $stdout = Get-Content -LiteralPath $stdoutPath
         }
+
+        if (Test-Path -LiteralPath $stderrPath) {
+            $stderr = Get-Content -LiteralPath $stderrPath
+        }
+
+        $combined = @($stdout) + @($stderr)
+        Set-Content -LiteralPath $LogPath -Value $combined
+
+        if (-not $Silent) {
+            foreach ($line in $combined) {
+                Write-Host $line
+            }
+        }
+
+        return $process.ExitCode
     }
-
-    Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
-
-    return $process.ExitCode
+    finally {
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 try {
@@ -169,17 +273,25 @@ try {
 
     $discordInstall = Get-DiscordInstall
 
-    if ($ForceDownload -or -not (Test-Path -LiteralPath $installerCli)) {
-        Download-InstallerCli -Url $downloadUrl -Destination $installerCli
+    $cachedInstallerIsValid = Test-InstallerChecksum `
+        -CliPath $installerCli `
+        -ChecksumsPath $checksumsFile `
+        -InstallerName $installerFileName
+
+    if ($ForceDownload -or -not $cachedInstallerIsValid) {
+        Download-InstallerCli `
+            -Url $downloadUrl `
+            -ChecksumsUrl $checksumsUrl `
+            -Destination $installerCli `
+            -ChecksumsDestination $checksumsFile `
+            -InstallerName $installerFileName
     }
 
-    if (-not (Test-Path -LiteralPath $installerCli)) {
-        throw "VencordInstallerCli.exe was not downloaded successfully."
-    }
+    Assert-InstallerChecksum -CliPath $installerCli -ChecksumsPath $checksumsFile -InstallerName $installerFileName
 
     Write-Info "Using $($discordInstall.Name)"
     Write-Info "Closing Discord if it is already running"
-    Stop-DiscordProcesses -ProcessNames @("Discord", "DiscordPTB", "DiscordCanary")
+    Stop-DiscordProcesses -ProcessNames @($discordInstall.ProcessName)
     Write-Info "Installing or updating Vencord"
 
     $originalEnv = @{
@@ -189,7 +301,12 @@ try {
     try {
         [Environment]::SetEnvironmentVariable("VENCORD_USER_DATA_DIR", $runtimeDir, "Process")
 
-        $exitCode = Invoke-InstallerCli -CliPath $installerCli -Branch $discordInstall.Branch -LogPath $logFile
+        $exitCode = Invoke-InstallerCli `
+            -CliPath $installerCli `
+            -Branch $discordInstall.Branch `
+            -LogPath $logFile `
+            -ChecksumsPath $checksumsFile `
+            -InstallerName $installerFileName
 
         if ($exitCode -ne 0) {
             throw "Vencord install failed. See $logFile"
@@ -200,9 +317,19 @@ try {
             if (-not $Silent) {
                 Write-Warning "Installer execution failed. Retrying once with a fresh CLI download."
             }
-            Download-InstallerCli -Url $downloadUrl -Destination $installerCli
+            Download-InstallerCli `
+                -Url $downloadUrl `
+                -ChecksumsUrl $checksumsUrl `
+                -Destination $installerCli `
+                -ChecksumsDestination $checksumsFile `
+                -InstallerName $installerFileName
 
-            $exitCode = Invoke-InstallerCli -CliPath $installerCli -Branch $discordInstall.Branch -LogPath $logFile
+            $exitCode = Invoke-InstallerCli `
+                -CliPath $installerCli `
+                -Branch $discordInstall.Branch `
+                -LogPath $logFile `
+                -ChecksumsPath $checksumsFile `
+                -InstallerName $installerFileName
 
             if ($exitCode -ne 0) {
                 throw "Vencord install failed after retry. See $logFile"
@@ -217,7 +344,7 @@ try {
     }
 
     Write-Info "Launching $($discordInstall.Name)"
-    Start-Process -FilePath $discordInstall.UpdateExe -ArgumentList "--processStart", $discordInstall.ProcessName | Out-Null
+    Start-Process -FilePath $discordInstall.UpdateExe -ArgumentList "--processStart", $discordInstall.ExecutableName | Out-Null
 }
 catch {
     $message = $_.Exception.Message

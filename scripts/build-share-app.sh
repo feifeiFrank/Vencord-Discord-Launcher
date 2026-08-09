@@ -16,10 +16,16 @@ mkdir -p "$RESOURCES_DIR" "$MACOS_DIR"
 
 cp "$ROOT_DIR/templates/Info.plist" "$CONTENTS_DIR/Info.plist"
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CONTENTS_DIR/Info.plist")"
+MINIMUM_MACOS_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$CONTENTS_DIR/Info.plist")"
 
 "$CLANG" \
     -fobjc-arc \
+    -Wall \
+    -Wextra \
     -isysroot "$SDKROOT" \
+    -mmacosx-version-min="$MINIMUM_MACOS_VERSION" \
+    -arch arm64 \
+    -arch x86_64 \
     -framework AppKit \
     -framework Foundation \
     "$APP_SOURCE" \
