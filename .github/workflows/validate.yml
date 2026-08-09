@@ -1,0 +1,62 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS build and package
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate, build, and verify package
+        run: ./scripts/check.sh
+
+  windows:
+    name: Windows PowerShell syntax and embedded payload
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate PowerShell and standalone launcher
+        shell: powershell
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "windows/run.ps1"),
+              [ref] $tokens,
+              [ref] $parseErrors
+          ) | Out-Null
+
+          if ($parseErrors.Count -ne 0) {
+              $parseErrors | Format-List | Out-String | Write-Error
+              exit 1
+          }
+
+          $cmd = Get-Content -LiteralPath "windows/VencordLauncher.cmd" -Raw
+          $source = Get-Content -LiteralPath "windows/run.ps1" -Raw
+          $marker = "# POWERSHELL-BEGIN"
+          $markerIndex = $cmd.LastIndexOf($marker)
+          if ($markerIndex -lt 0) {
+              throw "Standalone launcher payload marker is missing."
+          }
+
+          $payload = $cmd.Substring($markerIndex + $marker.Length).TrimStart([char[]] "`r`n")
+          $normalizedPayload = $payload.Replace("`r`n", "`n")
+          $normalizedSource = $source.Replace("`r`n", "`n")
+          if ($normalizedPayload -cne $normalizedSource) {
+              throw "windows/VencordLauncher.cmd is out of sync with windows/run.ps1."
+          }

@@ -1,10 +1,20 @@
 #import <AppKit/AppKit.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/file.h>
+#include <unistd.h>
 
-static NSString * const LogPath = @"/tmp/vencord-portable-install.log";
+static NSString * const DefaultLogPath = @"/tmp/vencord-portable-install.log";
 static NSFileHandle *LogHandle = nil;
+static int LauncherLockFileDescriptor = -1;
+static const unsigned long long MaxWrapperSize = 1024 * 1024;
+static const NSTimeInterval VencordUpdateCheckInterval = 60 * 60;
+static BOOL SetError(NSError **error, NSString *message);
 
 static NSString *DiscordAppPath(void) {
     NSString *overridePath = [NSProcessInfo processInfo].environment[@"DISCORD_APP_PATH"];
@@ -12,6 +22,11 @@ static NSString *DiscordAppPath(void) {
         return overridePath;
     }
     return @"/Applications/Discord.app";
+}
+
+static NSString *LauncherLogPath(void) {
+    NSString *overridePath = [NSProcessInfo processInfo].environment[@"DISCORD_WITH_VENCORD_LOG_PATH"];
+    return overridePath.length > 0 ? overridePath : DefaultLogPath;
 }
 
 static NSString *DiscordResourcesPath(void) {
@@ -26,11 +41,11 @@ static NSString *BackupAppAsarPath(void) {
     return [DiscordResourcesPath() stringByAppendingPathComponent:@"_app.asar"];
 }
 
-static NSString *BuildDirPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DiscordWithVencordPortable/build"];
-}
-
 static NSString *VencordDataDirPath(void) {
+    NSString *overridePath = [NSProcessInfo processInfo].environment[@"VENCORD_USER_DATA_DIR"];
+    if (overridePath.length > 0) {
+        return overridePath.stringByExpandingTildeInPath.stringByStandardizingPath;
+    }
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Vencord"];
 }
 
@@ -45,6 +60,54 @@ static NSString *PatcherPath(void) {
 static BOOL ShouldSkipLaunch(void) {
     NSString *value = [NSProcessInfo processInfo].environment[@"DISCORD_WITH_VENCORD_SKIP_LAUNCH"];
     return [value isEqualToString:@"1"] || [value.lowercaseString isEqualToString:@"true"];
+}
+
+static BOOL EnvironmentFlagIsEnabled(NSString *name) {
+    NSString *value = [NSProcessInfo processInfo].environment[name];
+    return [value isEqualToString:@"1"] || [value.lowercaseString isEqualToString:@"true"];
+}
+
+static BOOL ShouldRunHeadless(void) {
+    return EnvironmentFlagIsEnabled(@"DISCORD_WITH_VENCORD_HEADLESS");
+}
+
+static BOOL AcquireLauncherLock(NSError **error) {
+    NSString *lockPath = [VencordDataDirPath() stringByAppendingPathComponent:@"launcher.lock"];
+    int descriptor = open(lockPath.fileSystemRepresentation, O_CREAT | O_RDWR, 0600);
+    if (descriptor < 0) {
+        NSError *lockError = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        return SetError(error, [NSString stringWithFormat:@"Could not open launcher lock: %@", lockError.localizedDescription]);
+    }
+
+    int descriptorFlags = fcntl(descriptor, F_GETFD);
+    if (descriptorFlags < 0 || fcntl(descriptor, F_SETFD, descriptorFlags | FD_CLOEXEC) != 0) {
+        int lockErrorCode = errno;
+        close(descriptor);
+        NSError *lockError = [NSError errorWithDomain:NSPOSIXErrorDomain code:lockErrorCode userInfo:nil];
+        return SetError(error, [NSString stringWithFormat:@"Could not configure launcher lock: %@", lockError.localizedDescription]);
+    }
+
+    if (flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+        int lockErrorCode = errno;
+        close(descriptor);
+        if (lockErrorCode == EWOULDBLOCK) {
+            return SetError(error, @"Another Discord with Vencord Portable launch is already in progress");
+        }
+        NSError *lockError = [NSError errorWithDomain:NSPOSIXErrorDomain code:lockErrorCode userInfo:nil];
+        return SetError(error, [NSString stringWithFormat:@"Could not acquire launcher lock: %@", lockError.localizedDescription]);
+    }
+
+    LauncherLockFileDescriptor = descriptor;
+    return YES;
+}
+
+static void ReleaseLauncherLock(void) {
+    if (LauncherLockFileDescriptor < 0) {
+        return;
+    }
+    flock(LauncherLockFileDescriptor, LOCK_UN);
+    close(LauncherLockFileDescriptor);
+    LauncherLockFileDescriptor = -1;
 }
 
 static NSError *MakeError(NSString *message) {
@@ -77,17 +140,23 @@ static void LogMessage(NSString *level, NSString *format, ...) {
 
 static BOOL OpenLog(NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createFileAtPath:LogPath contents:nil attributes:nil];
-    LogHandle = [NSFileHandle fileHandleForWritingAtPath:LogPath];
+    [fm createFileAtPath:LauncherLogPath() contents:nil attributes:nil];
+    LogHandle = [NSFileHandle fileHandleForWritingAtPath:LauncherLogPath()];
     if (LogHandle == nil) {
-        return SetError(error, [NSString stringWithFormat:@"Could not open %@", LogPath]);
+        return SetError(error, [NSString stringWithFormat:@"Could not open %@", LauncherLogPath()]);
     }
     [LogHandle truncateFileAtOffset:0];
     return YES;
 }
 
-static BOOL FileContainsBytes(NSString *path, NSData *needle) {
+static BOOL SmallFileContainsBytes(NSString *path, NSData *needle) {
     if (needle.length == 0) {
+        return NO;
+    }
+
+    NSDictionary<NSFileAttributeKey, id> *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    NSNumber *fileSize = attributes[NSFileSize];
+    if (fileSize == nil || fileSize.unsignedLongLongValue > MaxWrapperSize) {
         return NO;
     }
 
@@ -103,7 +172,7 @@ static BOOL FileContainsBytes(NSString *path, NSData *needle) {
 static BOOL IsVencordWrapper(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSData *needle = [@"patcher.js" dataUsingEncoding:NSUTF8StringEncoding];
-    return [fm fileExistsAtPath:AppAsarPath()] && FileContainsBytes(AppAsarPath(), needle);
+    return [fm fileExistsAtPath:AppAsarPath()] && SmallFileContainsBytes(AppAsarPath(), needle);
 }
 
 static BOOL IsDiscordPatched(void) {
@@ -111,13 +180,88 @@ static BOOL IsDiscordPatched(void) {
     NSData *needle = [PatcherPath() dataUsingEncoding:NSUTF8StringEncoding];
     return [fm fileExistsAtPath:AppAsarPath()]
         && [fm fileExistsAtPath:BackupAppAsarPath()]
-        && FileContainsBytes(AppAsarPath(), needle);
+        && SmallFileContainsBytes(AppAsarPath(), needle);
 }
 
-static BOOL DownloadURLToPath(NSURL *url, NSString *destination, NSError **error) {
+static NSArray<NSString *> *VencordDistAssetNames(void) {
+    static NSArray<NSString *> *assets = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        assets = @[
+            @"patcher.js",
+            @"patcher.js.map",
+            @"patcher.js.LEGAL.txt",
+            @"preload.js",
+            @"preload.js.map",
+            @"renderer.js",
+            @"renderer.js.map",
+            @"renderer.js.LEGAL.txt",
+            @"renderer.css",
+            @"renderer.css.map"
+        ];
+    });
+    return assets;
+}
+
+static BOOL HasCompleteVencordDistAtPath(NSString *distPath) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *requiredFiles = [VencordDistAssetNames() arrayByAddingObject:@"package.json"];
+    for (NSString *asset in requiredFiles) {
+        NSString *path = [distPath stringByAppendingPathComponent:asset];
+        BOOL isDirectory = NO;
+        if (![fm fileExistsAtPath:path isDirectory:&isDirectory] || isDirectory) {
+            return NO;
+        }
+
+        NSNumber *fileSize = [[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize];
+        if (fileSize == nil || fileSize.unsignedLongLongValue == 0) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+static NSString *VencordUpdateMarkerPath(NSString *distPath) {
+    return [distPath stringByAppendingPathComponent:@".last-update-check"];
+}
+
+static BOOL WriteVencordUpdateMarker(NSString *distPath, NSError **error) {
+    NSString *timestamp = [NSString stringWithFormat:@"%@\n", [NSDate date]];
+    return [timestamp writeToFile:VencordUpdateMarkerPath(distPath)
+                       atomically:YES
+                         encoding:NSUTF8StringEncoding
+                            error:error];
+}
+
+static BOOL ShouldRefreshVencordDist(void) {
+    if (EnvironmentFlagIsEnabled(@"VENCORD_FORCE_UPDATE")) {
+        return YES;
+    }
+    if (!HasCompleteVencordDistAtPath(VencordDistDirPath())) {
+        return YES;
+    }
+
+    NSDate *lastCheck = [[[NSFileManager defaultManager] attributesOfItemAtPath:VencordUpdateMarkerPath(VencordDistDirPath())
+                                                                         error:nil] objectForKey:NSFileModificationDate];
+    if (lastCheck == nil) {
+        return YES;
+    }
+    NSTimeInterval age = -lastCheck.timeIntervalSinceNow;
+    return age < 0 || age >= VencordUpdateCheckInterval;
+}
+
+static NSData *DownloadURLData(NSURL *url, NSDictionary<NSString *, NSString *> *headers, NSError **error) {
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.timeoutInterval = 120;
-    [request setValue:@"DiscordWithVencordPortable/1.0" forHTTPHeaderField:@"User-Agent"];
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    if (version.length == 0) {
+        version = @"development";
+    }
+    [request setValue:[NSString stringWithFormat:@"DiscordWithVencordPortable/%@", version]
+   forHTTPHeaderField:@"User-Agent"];
+    for (NSString *header in headers) {
+        [request setValue:headers[header] forHTTPHeaderField:header];
+    }
 
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block NSData *downloadedData = nil;
@@ -141,86 +285,245 @@ static BOOL DownloadURLToPath(NSURL *url, NSString *destination, NSError **error
     long waitResult = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_SEC)));
     if (waitResult != 0) {
         [task cancel];
-        return SetError(error, [NSString stringWithFormat:@"Timed out downloading %@", url.lastPathComponent]);
+        SetError(error, [NSString stringWithFormat:@"Timed out downloading %@", url.lastPathComponent]);
+        return nil;
     }
 
     if (downloadError != nil) {
         if (error != NULL) {
             *error = downloadError;
         }
-        return NO;
+        return nil;
     }
 
     if (statusCode < 200 || statusCode >= 300) {
-        return SetError(error, [NSString stringWithFormat:@"HTTP %ld for %@", (long)statusCode, url.lastPathComponent]);
+        SetError(error, [NSString stringWithFormat:@"HTTP %ld for %@", (long)statusCode, url.lastPathComponent]);
+        return nil;
     }
 
     if (downloadedData == nil) {
-        return SetError(error, [NSString stringWithFormat:@"No data returned for %@", url.lastPathComponent]);
+        SetError(error, [NSString stringWithFormat:@"No data returned for %@", url.lastPathComponent]);
+        return nil;
     }
 
-    return [downloadedData writeToFile:destination options:NSDataWritingAtomic error:error];
+    return downloadedData;
+}
+
+static NSDictionary<NSString *, id> *LatestVencordReleaseMetadata(NSError **error) {
+    NSURL *releaseURL = [NSURL URLWithString:@"https://api.github.com/repos/Vendicated/Vencord/releases/latest"];
+    NSDictionary *headers = @{
+        @"Accept": @"application/vnd.github+json",
+        @"X-GitHub-Api-Version": @"2022-11-28"
+    };
+    NSData *releaseData = DownloadURLData(releaseURL, headers, error);
+    if (releaseData == nil) {
+        return nil;
+    }
+
+    id object = [NSJSONSerialization JSONObjectWithData:releaseData options:0 error:error];
+    if (![object isKindOfClass:[NSDictionary class]]) {
+        SetError(error, @"GitHub returned invalid Vencord release metadata");
+        return nil;
+    }
+
+    NSDictionary *release = (NSDictionary *)object;
+    NSString *tag = release[@"tag_name"];
+    NSArray *assets = release[@"assets"];
+    if (![tag isKindOfClass:[NSString class]] || tag.length == 0 || ![assets isKindOfClass:[NSArray class]]) {
+        SetError(error, @"Vencord release metadata is missing its tag or assets");
+        return nil;
+    }
+
+    NSSet<NSString *> *requiredNames = [NSSet setWithArray:VencordDistAssetNames()];
+    NSMutableDictionary<NSString *, NSDictionary *> *assetsByName = [NSMutableDictionary dictionary];
+    for (id candidate in assets) {
+        if (![candidate isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *asset = (NSDictionary *)candidate;
+        NSString *name = asset[@"name"];
+        if (![name isKindOfClass:[NSString class]] || ![requiredNames containsObject:name]) {
+            continue;
+        }
+
+        NSString *urlString = asset[@"url"];
+        NSString *digest = asset[@"digest"];
+        NSNumber *size = asset[@"size"];
+        BOOL validDigest = [digest isKindOfClass:[NSString class]]
+            && [digest hasPrefix:@"sha256:"]
+            && digest.length == 71;
+        if (![urlString isKindOfClass:[NSString class]]
+            || !validDigest
+            || ![size isKindOfClass:[NSNumber class]]
+            || size.unsignedLongLongValue == 0
+            || assetsByName[name] != nil) {
+            SetError(error, [NSString stringWithFormat:@"Invalid metadata for Vencord asset %@", name]);
+            return nil;
+        }
+        assetsByName[name] = @{
+            @"url": urlString,
+            @"digest": digest,
+            @"size": size
+        };
+    }
+
+    if (assetsByName.count != requiredNames.count) {
+        NSMutableSet<NSString *> *missing = [requiredNames mutableCopy];
+        [missing minusSet:[NSSet setWithArray:assetsByName.allKeys]];
+        SetError(error, [NSString stringWithFormat:@"Vencord release %@ is missing required assets: %@",
+                                                   tag,
+                                                   [[missing.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "]]);
+        return nil;
+    }
+
+    return @{
+        @"tag": tag,
+        @"assets": assetsByName
+    };
+}
+
+static NSString *SHA256HexForData(NSData *data) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (NSUInteger index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
+        [hex appendFormat:@"%02x", digest[index]];
+    }
+    return hex;
+}
+
+static BOOL DownloadVencordAsset(NSString *name, NSDictionary *metadata, NSString *destination, NSError **error) {
+    NSURL *url = [NSURL URLWithString:metadata[@"url"]];
+    NSDictionary *headers = @{
+        @"Accept": @"application/octet-stream",
+        @"X-GitHub-Api-Version": @"2022-11-28"
+    };
+    NSData *data = DownloadURLData(url, headers, error);
+    if (data == nil) {
+        return NO;
+    }
+
+    NSNumber *expectedSize = metadata[@"size"];
+    if (data.length != expectedSize.unsignedLongLongValue) {
+        return SetError(error, [NSString stringWithFormat:@"Size verification failed for %@", name]);
+    }
+
+    NSString *expectedDigest = [metadata[@"digest"] substringFromIndex:7];
+    NSString *actualDigest = SHA256HexForData(data);
+    if (![actualDigest isEqualToString:expectedDigest.lowercaseString]) {
+        return SetError(error, [NSString stringWithFormat:@"SHA-256 verification failed for %@", name]);
+    }
+
+    return [data writeToFile:destination options:NSDataWritingAtomic error:error];
+}
+
+static void CleanupStaleVencordStagingDirectories(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:VencordDataDirPath() error:nil];
+    for (NSString *entry in entries) {
+        if (![entry hasPrefix:@".dist-download-"]) {
+            continue;
+        }
+        NSString *path = [VencordDataDirPath() stringByAppendingPathComponent:entry];
+        NSDate *modified = [[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileModificationDate];
+        if (modified != nil && -modified.timeIntervalSinceNow >= 24 * 60 * 60) {
+            if ([fm removeItemAtPath:path error:nil]) {
+                LogMessage(@"info", @"Removed stale Vencord staging directory %@", entry);
+            }
+        }
+    }
+}
+
+static BOOL ActivateVencordDist(NSString *stagedPath, NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *activePath = VencordDistDirPath();
+
+    if (![fm fileExistsAtPath:activePath]) {
+        NSError *moveError = nil;
+        if ([fm moveItemAtPath:stagedPath toPath:activePath error:&moveError]) {
+            return YES;
+        }
+        if (![fm fileExistsAtPath:activePath]) {
+            if (error != NULL) {
+                *error = moveError;
+            }
+            return NO;
+        }
+    }
+
+    if (renamex_np(stagedPath.fileSystemRepresentation,
+                   activePath.fileSystemRepresentation,
+                   RENAME_SWAP) != 0) {
+        NSError *swapError = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        return SetError(error, [NSString stringWithFormat:@"Could not atomically activate Vencord files: %@",
+                                                          swapError.localizedDescription]);
+    }
+
+    NSError *cleanupError = nil;
+    if (![fm removeItemAtPath:stagedPath error:&cleanupError]) {
+        LogMessage(@"warning", @"Updated Vencord but could not remove the previous dist: %@", cleanupError.localizedDescription);
+    }
+    return YES;
+}
+
+static BOOL FallBackToCachedVencordDist(NSString *stagedPath, NSError *updateError, NSError **error) {
+    [[NSFileManager defaultManager] removeItemAtPath:stagedPath error:nil];
+    if (HasCompleteVencordDistAtPath(VencordDistDirPath())) {
+        WriteVencordUpdateMarker(VencordDistDirPath(), NULL);
+        LogMessage(@"info", @"Could not update Vencord files; using complete cached dist: %@", updateError.localizedDescription);
+        return YES;
+    }
+    return SetError(error, [NSString stringWithFormat:@"Could not download Vencord files and no complete cache exists: %@",
+                                                      updateError.localizedDescription]);
 }
 
 static BOOL DownloadVencordDist(NSError **error) {
-    NSArray<NSString *> *assets = @[
-        @"patcher.js",
-        @"patcher.js.map",
-        @"patcher.js.LEGAL.txt",
-        @"preload.js",
-        @"preload.js.map",
-        @"renderer.js",
-        @"renderer.js.map",
-        @"renderer.js.LEGAL.txt",
-        @"renderer.css",
-        @"renderer.css.map"
-    ];
-
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *tmpDir = [BuildDirPath() stringByAppendingPathComponent:@"vencord-dist-download"];
-    if ([fm fileExistsAtPath:tmpDir] && ![fm removeItemAtPath:tmpDir error:error]) {
-        return NO;
+    if (!ShouldRefreshVencordDist()) {
+        LogMessage(@"info", @"Using recently checked Vencord files");
+        return YES;
     }
+
+    CleanupStaleVencordStagingDirectories();
+    NSString *tmpDir = [VencordDataDirPath() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@".dist-download-%@", NSUUID.UUID.UUIDString]];
     if (![fm createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:error]) {
         return NO;
     }
 
-    LogMessage(@"info", @"Downloading latest Vencord files");
-    for (NSString *asset in assets) {
-        NSString *urlString = [NSString stringWithFormat:@"https://github.com/Vendicated/Vencord/releases/latest/download/%@", asset];
-        NSURL *url = [NSURL URLWithString:urlString];
-        NSError *downloadError = nil;
+    NSError *updateError = nil;
+    NSDictionary *release = LatestVencordReleaseMetadata(&updateError);
+    if (release == nil) {
+        return FallBackToCachedVencordDist(tmpDir, updateError, error);
+    }
+
+    LogMessage(@"info", @"Downloading and verifying Vencord release %@", release[@"tag"]);
+    NSDictionary<NSString *, NSDictionary *> *assets = release[@"assets"];
+    for (NSString *asset in VencordDistAssetNames()) {
         NSString *destination = [tmpDir stringByAppendingPathComponent:asset];
-        if (!DownloadURLToPath(url, destination, &downloadError)) {
-            [fm removeItemAtPath:tmpDir error:nil];
-            if ([fm fileExistsAtPath:PatcherPath()]) {
-                LogMessage(@"info", @"Could not update Vencord files; using cached dist");
-                return YES;
-            }
-            NSString *message = [NSString stringWithFormat:@"Could not download Vencord files and no cached dist exists: %@", downloadError.localizedDescription];
-            return SetError(error, message);
+        if (!DownloadVencordAsset(asset, assets[asset], destination, &updateError)) {
+            return FallBackToCachedVencordDist(tmpDir, updateError, error);
         }
     }
 
     NSString *packageJSON = @"{}\n";
     NSString *packagePath = [tmpDir stringByAppendingPathComponent:@"package.json"];
-    if (![packageJSON writeToFile:packagePath atomically:YES encoding:NSUTF8StringEncoding error:error]) {
-        return NO;
+    if (![packageJSON writeToFile:packagePath atomically:YES encoding:NSUTF8StringEncoding error:&updateError]) {
+        return FallBackToCachedVencordDist(tmpDir, updateError, error);
     }
 
-    NSArray<NSString *> *allAssets = [assets arrayByAddingObject:@"package.json"];
-    for (NSString *asset in allAssets) {
-        NSString *source = [tmpDir stringByAppendingPathComponent:asset];
-        NSString *destination = [VencordDistDirPath() stringByAppendingPathComponent:asset];
-        if ([fm fileExistsAtPath:destination] && ![fm removeItemAtPath:destination error:error]) {
-            return NO;
-        }
-        if (![fm moveItemAtPath:source toPath:destination error:error]) {
-            return NO;
-        }
+    if (!HasCompleteVencordDistAtPath(tmpDir)) {
+        updateError = MakeError(@"Downloaded Vencord files were incomplete");
+        return FallBackToCachedVencordDist(tmpDir, updateError, error);
+    }
+    if (!WriteVencordUpdateMarker(tmpDir, &updateError)) {
+        return FallBackToCachedVencordDist(tmpDir, updateError, error);
     }
 
-    [fm removeItemAtPath:tmpDir error:nil];
+    if (!ActivateVencordDist(tmpDir, &updateError)) {
+        return FallBackToCachedVencordDist(tmpDir, updateError, error);
+    }
     return YES;
 }
 
@@ -363,19 +666,20 @@ static BOOL PatchDiscord(NSError **error) {
 }
 
 static void CloseDiscordIfRunning(void) {
+    if (ShouldRunHeadless()) {
+        return;
+    }
+
     NSMutableArray<NSRunningApplication *> *runningDiscordApps = [NSMutableArray array];
     NSURL *discordURL = [NSURL fileURLWithPath:DiscordAppPath()].standardizedURL;
+    BOOL hasPathOverride = [NSProcessInfo processInfo].environment[@"DISCORD_APP_PATH"].length > 0;
 
     for (NSRunningApplication *app in [NSWorkspace sharedWorkspace].runningApplications) {
-        if ([app.bundleIdentifier isEqualToString:@"com.hnc.Discord"]) {
-            [runningDiscordApps addObject:app];
-            continue;
-        }
         if ([app.bundleURL.standardizedURL.path isEqualToString:discordURL.path]) {
             [runningDiscordApps addObject:app];
             continue;
         }
-        if ([app.localizedName isEqualToString:@"Discord"]) {
+        if (!hasPathOverride && ([app.bundleIdentifier isEqualToString:@"com.hnc.Discord"] || [app.localizedName isEqualToString:@"Discord"])) {
             [runningDiscordApps addObject:app];
         }
     }
@@ -422,6 +726,7 @@ static BOOL LaunchDiscord(NSError **error) {
     [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:DiscordAppPath()]
                                          configuration:configuration
                                      completionHandler:^(NSRunningApplication *app, NSError *openError) {
+        (void)app;
         launchError = openError;
         dispatch_semaphore_signal(semaphore);
     }];
@@ -448,13 +753,6 @@ static BOOL RunLauncher(NSError **error) {
     BOOL isDirectory = NO;
     if (![fm fileExistsAtPath:DiscordAppPath() isDirectory:&isDirectory] || !isDirectory) {
         return SetError(error, [NSString stringWithFormat:@"Discord not found at %@", DiscordAppPath()]);
-    }
-
-    NSArray<NSString *> *directories = @[BuildDirPath(), VencordDataDirPath(), VencordDistDirPath()];
-    for (NSString *directory in directories) {
-        if (![fm createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:error]) {
-            return NO;
-        }
     }
 
     if (!DownloadVencordDist(error)) {
@@ -488,6 +786,11 @@ static BOOL RunLauncher(NSError **error) {
 }
 
 static void ShowFailureAlert(NSString *details) {
+    if (ShouldRunHeadless()) {
+        fprintf(stderr, "Vencord install failed: %s\n", details.UTF8String);
+        return;
+    }
+
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
@@ -513,22 +816,39 @@ static void ShowFailureAlert(NSString *details) {
     [alert runModal];
 }
 
-int main(int argc, const char *argv[]) {
+int main(void) {
     @autoreleasepool {
-        [NSApplication sharedApplication];
+        if (!ShouldRunHeadless()) {
+            [NSApplication sharedApplication];
+        }
 
         NSError *error = nil;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm createDirectoryAtPath:VencordDataDirPath() withIntermediateDirectories:YES attributes:nil error:&error]) {
+            ShowFailureAlert(error.localizedDescription);
+            return 1;
+        }
+
+        if (!AcquireLauncherLock(&error)) {
+            ShowFailureAlert(error.localizedDescription);
+            return 1;
+        }
+
         if (!OpenLog(&error)) {
+            ReleaseLauncherLock();
             ShowFailureAlert(error.localizedDescription);
             return 1;
         }
 
-        if (!RunLauncher(&error)) {
+        BOOL launchSucceeded = RunLauncher(&error);
+        if (!launchSucceeded) {
             LogMessage(@"error", @"%@", error.localizedDescription);
+            ReleaseLauncherLock();
             ShowFailureAlert(error.localizedDescription);
             return 1;
         }
 
+        ReleaseLauncherLock();
         [LogHandle closeFile];
         return 0;
     }

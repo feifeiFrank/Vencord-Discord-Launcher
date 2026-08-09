@@ -30,14 +30,14 @@ It is especially useful if you were searching for terms like:
 
 ## Platforms
 
-- macOS: supported by `run.command`
+- macOS 12 or newer on Apple Silicon and Intel: supported by `run.command`
 - Windows: supported by [`windows/run.cmd`](./windows/run.cmd)
 
 ## Requirements
 
 ### macOS
 
-- macOS
+- macOS 12 or newer
 - Discord installed at `/Applications/Discord.app`
 - Internet access for the first launch and for future Vencord updates
 - Apple Command Line Tools only if you build the macOS share app from source
@@ -67,13 +67,13 @@ It is especially useful if you were searching for terms like:
 
 1. Clone this repo anywhere outside OneDrive or cloud-sync folders.
 2. Double-click [`windows/run.vbs`](./windows/run.vbs) for the app-like launcher, or [`windows/run.cmd`](./windows/run.cmd) if you want to see logs in a terminal.
-3. The launcher downloads the official `VencordInstallerCli.exe` on first run.
+3. The launcher downloads the official `VencordInstallerCli.exe` and verifies it against the release's published SHA-256 checksum on first run.
 4. If Windows asks for permission, allow it and retry if needed.
 
 ### Windows single-file share
 
 - Use [`windows/VencordLauncher.cmd`](./windows/VencordLauncher.cmd) if you want one file you can send to other people.
-- The single-file launcher still downloads the official `VencordInstallerCli.exe` on first run.
+- The single-file launcher still downloads and verifies the official `VencordInstallerCli.exe` on first run.
 - It stores the downloaded CLI under `%LOCALAPPDATA%\DiscordWithVencordPortable\cache`.
 
 ## What the launchers do
@@ -81,7 +81,7 @@ It is especially useful if you were searching for terms like:
 ### macOS
 
 1. Finds the installed official Discord desktop app
-2. Downloads the latest Vencord release `dist` files under `~/Library/Application Support/Vencord/dist`
+2. Checks for updated Vencord release `dist` files under `~/Library/Application Support/Vencord/dist`
 3. Checks whether Discord's `app.asar` wrapper already points at that Vencord dist path
 4. If Discord is already patched, starts Discord without modifying `/Applications/Discord.app`
 5. If Discord needs patching, quits Discord, moves `app.asar` to `_app.asar`, and writes a small Vencord wrapper `app.asar`
@@ -97,16 +97,18 @@ After the first successful run, Vencord release files are cached under:
 ~/Library/Application Support/Vencord/dist
 ```
 
-If the Vencord dist update fails later because the Mac is offline, the launcher keeps using the cached dist as long as `patcher.js` already exists.
+The launcher reuses a complete cache for one hour before checking again, so normal Discord launches avoid ten repeated downloads. Set `VENCORD_FORCE_UPDATE=1` when launching if you need an immediate refresh. Each refresh uses one GitHub Release snapshot, verifies every asset's published size and SHA-256 digest, and atomically swaps a complete staging directory into place. A launcher lock prevents simultaneous app instances from racing while updating or patching.
+
+If the Vencord dist update fails later because the Mac is offline, the launcher only falls back when every required cached file is present.
 
 ### Windows
 
 1. Finds the installed official Discord desktop app
-2. Downloads the latest official `VencordInstallerCli.exe` if needed
-3. Runs the Vencord installer CLI against Discord
-4. Launches Discord
+2. Downloads the latest official `VencordInstallerCli.exe` and its published checksum if needed
+3. Verifies SHA-256 before every execution
+4. Closes only the selected Discord channel, runs the installer CLI, and launches that channel
 
-## Build a share bundle
+## Build and validate
 
 Run:
 
@@ -122,12 +124,34 @@ The generated release zip is:
 ./output/Discord.with.Vencord.Portable.app.zip
 ```
 
+The macOS app is a universal binary for `arm64` and `x86_64`, with its Mach-O deployment target read from `LSMinimumSystemVersion` in `templates/Info.plist`.
+
+Run the complete local macOS validation suite with:
+
+```bash
+./scripts/check.sh
+```
+
+Run the isolated first-download integration path when network access is available:
+
+```bash
+./scripts/smoke-test-macos.sh --download
+```
+
+Build both release archives and their checksums with:
+
+```bash
+./scripts/build-release.sh
+```
+
+Release output includes the macOS app zip, a Windows zip containing the standalone launcher, and `SHA256SUMS.txt`.
+
 ## Troubleshooting
 
 - If patching fails, check `/tmp/vencord-portable-install.log`
 - If the macOS share app fails to build from source, check that Apple Command Line Tools are installed
 - If macOS blocks patching, open `System Settings` -> `Privacy & Security` -> `App Management` and enable `Discord with Vencord Portable`
-- If you want to force a clean macOS rebuild, delete `~/Library/Caches/DiscordWithVencordPortable` and run the app again
+- If you need to bypass the one-hour Vencord update cache, launch with `VENCORD_FORCE_UPDATE=1`
 - If Discord updates and Vencord disappears, run `run.command` or the generated macOS share app again
 - If macOS shows "Apple could not verify ... is free of malware", go to `System Settings` -> `Privacy & Security` and click `Open Anyway`
 - If macOS blocks writes to `/Applications/Discord.app`, grant the generated app `App Management` permission and retry
