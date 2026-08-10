@@ -30,14 +30,17 @@ It is especially useful if you were searching for terms like:
 
 ## Platforms
 
-- macOS 12 or newer on Apple Silicon and Intel: supported by `run.command`
+- macOS 12 or newer on Apple Silicon (`arm64`): supported by `run.command`
 - Windows: supported by [`windows/run.cmd`](./windows/run.cmd)
+
+Version 0.4.0 and newer focus on Apple Silicon. [Apple has announced](https://developer.apple.com/documentation/Apple-Silicon/about-the-rosetta-translation-environment) that macOS Tahoe 26 is the last release for Intel-based Macs and that general-purpose Rosetta support ends after macOS 27. Intel Mac users can continue using the [v0.3.1 universal release](https://github.com/feifeiFrank/Vencord-Discord-Launcher/releases/tag/v0.3.1).
 
 ## Requirements
 
 ### macOS
 
 - macOS 12 or newer
+- An Apple Silicon Mac (M1 or newer)
 - Discord installed at `/Applications/Discord.app`
 - Internet access for the first launch and for future Vencord updates
 - Apple Command Line Tools only if you build the macOS share app from source
@@ -55,13 +58,13 @@ It is especially useful if you were searching for terms like:
 
 1. Clone this repo anywhere outside OneDrive or iCloud syncing folders.
 2. Double-click [`run.command`](./run.command).
-3. The first run downloads the latest Vencord release files.
-4. If macOS says the app cannot be opened because Apple cannot verify it:
-5. Open `System Settings` -> `Privacy & Security`
-6. Scroll to the Security section
-7. Click `Open Anyway` for the blocked app
-8. Run the app again and confirm the second prompt if macOS asks again
-9. If macOS blocks writes to Discord, grant the generated app `App Management` permission and run it again.
+3. A progress window shows each check, download, verification, patch, and launch stage.
+4. The first run downloads the latest Vencord release files.
+5. A final message confirms what was updated and whether Discord started successfully.
+6. If macOS says the app cannot be opened because Apple cannot verify it, open `System Settings` -> `Privacy & Security`.
+7. Scroll to the Security section and click `Open Anyway` for the blocked app.
+8. Run the app again and confirm the second prompt if macOS asks again.
+9. If macOS blocks writes to Discord, use the launcher's `Open App Management` button, grant permission, and run it again.
 
 ### Windows
 
@@ -83,9 +86,11 @@ It is especially useful if you were searching for terms like:
 1. Finds the installed official Discord desktop app
 2. Checks for updated Vencord release `dist` files under `~/Library/Application Support/Vencord/dist`
 3. Checks whether Discord's `app.asar` wrapper already points at that Vencord dist path
-4. If Discord is already patched, starts Discord without modifying `/Applications/Discord.app`
-5. If Discord needs patching, quits Discord, moves `app.asar` to `_app.asar`, and writes a small Vencord wrapper `app.asar`
-6. Verifies Discord was patched with the official Vencord data path before launching Discord
+4. If Discord is already patched and Vencord did not change, starts Discord without modifying `/Applications/Discord.app`
+5. If new Vencord files were installed, restarts an already-running Discord so the update is actually loaded
+6. If Discord needs patching, quits Discord, moves `app.asar` to `_app.asar`, and writes a small Vencord wrapper `app.asar`
+7. Verifies Discord was patched with the official Vencord data path before launching Discord
+8. Shows visible progress throughout the operation and a completion summary at the end
 
 The generated macOS share app uses a native AppKit executable instead of a shell, Python, or AppleScript patch path. This keeps macOS App Management attribution on the launcher app itself.
 
@@ -121,10 +126,12 @@ Output goes to `./output/`.
 The generated release zip is:
 
 ```text
-./output/Discord.with.Vencord.Portable.app.zip
+./output/Discord.with.Vencord.Portable.macOS-arm64.zip
 ```
 
-The macOS app is a universal binary for `arm64` and `x86_64`, with its Mach-O deployment target read from `LSMinimumSystemVersion` in `templates/Info.plist`.
+The macOS app is an Apple Silicon-only `arm64` binary. The build uses size optimization, dead-code stripping, symbol stripping, and a metadata-free ZIP. Its deployment target is still read from `LSMinimumSystemVersion` in `templates/Info.plist`.
+
+The v0.4.0 macOS archive is 20,948 bytes, down from 53,370 bytes in v0.3.1: a 60.7% reduction even after adding the new status interface.
 
 Run the complete local macOS validation suite with:
 
@@ -144,7 +151,7 @@ Build both release archives and their checksums with:
 ./scripts/build-release.sh
 ```
 
-Release output includes the macOS app zip, a Windows zip containing the standalone launcher, and `SHA256SUMS.txt`.
+Release output includes the Apple Silicon macOS app zip, a Windows zip containing the standalone launcher, and `SHA256SUMS.txt`.
 
 ## Troubleshooting
 
@@ -153,6 +160,7 @@ Release output includes the macOS app zip, a Windows zip containing the standalo
 - If macOS blocks patching, open `System Settings` -> `Privacy & Security` -> `App Management` and enable `Discord with Vencord Portable`
 - If you need to bypass the one-hour Vencord update cache, launch with `VENCORD_FORCE_UPDATE=1`
 - If Discord updates and Vencord disappears, run `run.command` or the generated macOS share app again
+- If the launcher says another launch is already running, wait for the visible launch to finish before retrying
 - If macOS shows "Apple could not verify ... is free of malware", go to `System Settings` -> `Privacy & Security` and click `Open Anyway`
 - If macOS blocks writes to `/Applications/Discord.app`, grant the generated app `App Management` permission and retry
 - The generated share app is not a zero-setup installer; recipients may still need to approve permissions on their own Mac

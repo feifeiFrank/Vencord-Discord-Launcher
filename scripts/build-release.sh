@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="$ROOT_DIR/output"
+MACOS_ARCHIVE="$OUTPUT_DIR/Discord.with.Vencord.Portable.macOS-arm64.zip"
 WINDOWS_ARCHIVE="$OUTPUT_DIR/Discord.with.Vencord.Portable.Windows.zip"
 CHECKSUMS_FILE="$OUTPUT_DIR/SHA256SUMS.txt"
 STAGING_ROOT="$(mktemp -d /private/tmp/discord-vencord-release.XXXXXX)"
@@ -31,7 +32,7 @@ rm -f "$WINDOWS_ARCHIVE" "$CHECKSUMS_FILE"
 (
     cd "$OUTPUT_DIR"
     /usr/bin/shasum -a 256 \
-        "Discord.with.Vencord.Portable.app.zip" \
+        "${MACOS_ARCHIVE:t}" \
         "Discord.with.Vencord.Portable.Windows.zip" \
         >"SHA256SUMS.txt"
 )

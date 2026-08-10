@@ -11,7 +11,16 @@
 
 static NSString * const DefaultLogPath = @"/tmp/vencord-portable-install.log";
 static NSFileHandle *LogHandle = nil;
+static NSWindow *StatusWindow = nil;
+static NSTextField *StatusLabel = nil;
+static NSProgressIndicator *StatusProgress = nil;
 static int LauncherLockFileDescriptor = -1;
+static BOOL LogWasOpened = NO;
+static BOOL UsedCachedVencordFallback = NO;
+static BOOL UpdatedVencord = NO;
+static BOOL PatchedDiscord = NO;
+static BOOL LaunchedDiscord = NO;
+static BOOL DiscordFileOperationFailed = NO;
 static const unsigned long long MaxWrapperSize = 1024 * 1024;
 static const NSTimeInterval VencordUpdateCheckInterval = 60 * 60;
 static BOOL SetError(NSError **error, NSString *message);
@@ -138,6 +147,19 @@ static void LogMessage(NSString *level, NSString *format, ...) {
     }
 }
 
+static void ReportStage(NSString *message, double progress) {
+    LogMessage(@"status", @"%@", message);
+    if (ShouldRunHeadless()) {
+        return;
+    }
+
+    double clampedProgress = progress < 0.0 ? 0.0 : (progress > 1.0 ? 1.0 : progress);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        StatusLabel.stringValue = message;
+        StatusProgress.doubleValue = clampedProgress;
+    });
+}
+
 static BOOL OpenLog(NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createFileAtPath:LauncherLogPath() contents:nil attributes:nil];
@@ -146,6 +168,7 @@ static BOOL OpenLog(NSError **error) {
         return SetError(error, [NSString stringWithFormat:@"Could not open %@", LauncherLogPath()]);
     }
     [LogHandle truncateFileAtOffset:0];
+    LogWasOpened = YES;
     return YES;
 }
 
@@ -471,7 +494,9 @@ static BOOL FallBackToCachedVencordDist(NSString *stagedPath, NSError *updateErr
     [[NSFileManager defaultManager] removeItemAtPath:stagedPath error:nil];
     if (HasCompleteVencordDistAtPath(VencordDistDirPath())) {
         WriteVencordUpdateMarker(VencordDistDirPath(), NULL);
+        UsedCachedVencordFallback = YES;
         LogMessage(@"info", @"Could not update Vencord files; using complete cached dist: %@", updateError.localizedDescription);
+        ReportStage(@"Update unavailable — using complete cached Vencord files…", 0.72);
         return YES;
     }
     return SetError(error, [NSString stringWithFormat:@"Could not download Vencord files and no complete cache exists: %@",
@@ -482,9 +507,11 @@ static BOOL DownloadVencordDist(NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if (!ShouldRefreshVencordDist()) {
         LogMessage(@"info", @"Using recently checked Vencord files");
+        ReportStage(@"Using recently checked Vencord files…", 0.72);
         return YES;
     }
 
+    ReportStage(@"Checking for Vencord updates…", 0.12);
     CleanupStaleVencordStagingDirectories();
     NSString *tmpDir = [VencordDataDirPath() stringByAppendingPathComponent:
         [NSString stringWithFormat:@".dist-download-%@", NSUUID.UUID.UUIDString]];
@@ -500,13 +527,22 @@ static BOOL DownloadVencordDist(NSError **error) {
 
     LogMessage(@"info", @"Downloading and verifying Vencord release %@", release[@"tag"]);
     NSDictionary<NSString *, NSDictionary *> *assets = release[@"assets"];
-    for (NSString *asset in VencordDistAssetNames()) {
+    NSArray<NSString *> *assetNames = VencordDistAssetNames();
+    NSUInteger assetIndex = 0;
+    for (NSString *asset in assetNames) {
+        assetIndex++;
+        double assetProgress = 0.15 + (0.5 * ((double)assetIndex / (double)assetNames.count));
+        ReportStage([NSString stringWithFormat:@"Downloading Vencord (%lu of %lu)…",
+                                               (unsigned long)assetIndex,
+                                               (unsigned long)assetNames.count],
+                    assetProgress);
         NSString *destination = [tmpDir stringByAppendingPathComponent:asset];
         if (!DownloadVencordAsset(asset, assets[asset], destination, &updateError)) {
             return FallBackToCachedVencordDist(tmpDir, updateError, error);
         }
     }
 
+    ReportStage(@"Verifying downloaded Vencord files…", 0.70);
     NSString *packageJSON = @"{}\n";
     NSString *packagePath = [tmpDir stringByAppendingPathComponent:@"package.json"];
     if (![packageJSON writeToFile:packagePath atomically:YES encoding:NSUTF8StringEncoding error:&updateError]) {
@@ -521,9 +557,11 @@ static BOOL DownloadVencordDist(NSError **error) {
         return FallBackToCachedVencordDist(tmpDir, updateError, error);
     }
 
+    ReportStage(@"Activating the verified Vencord update…", 0.76);
     if (!ActivateVencordDist(tmpDir, &updateError)) {
         return FallBackToCachedVencordDist(tmpDir, updateError, error);
     }
+    UpdatedVencord = YES;
     return YES;
 }
 
@@ -539,6 +577,7 @@ static BOOL PrepareDiscordForPatch(NSError **error) {
         NSString *staleBackup = [DiscordResourcesPath() stringByAppendingPathComponent:[NSString stringWithFormat:@"_app.asar.stale.%@", Timestamp()]];
         LogMessage(@"info", @"Moving stale _app.asar backup to %@", staleBackup.lastPathComponent);
         if (![fm moveItemAtPath:BackupAppAsarPath() toPath:staleBackup error:error]) {
+            DiscordFileOperationFailed = YES;
             return NO;
         }
     }
@@ -633,6 +672,7 @@ static BOOL PatchDiscord(NSError **error) {
             }
             LogMessage(@"info", @"Moving app.asar to _app.asar");
             if (![fm moveItemAtPath:AppAsarPath() toPath:BackupAppAsarPath() error:&innerError]) {
+                DiscordFileOperationFailed = YES;
                 if (error != NULL) {
                     *error = MakeError([NSString stringWithFormat:@"Failed to patch Discord: %@", innerError.localizedDescription]);
                 }
@@ -643,6 +683,7 @@ static BOOL PatchDiscord(NSError **error) {
     } else {
         LogMessage(@"info", @"Moving app.asar to _app.asar");
         if (![fm moveItemAtPath:AppAsarPath() toPath:BackupAppAsarPath() error:&innerError]) {
+            DiscordFileOperationFailed = YES;
             if (error != NULL) {
                 *error = MakeError([NSString stringWithFormat:@"Failed to patch Discord: %@", innerError.localizedDescription]);
             }
@@ -653,6 +694,7 @@ static BOOL PatchDiscord(NSError **error) {
 
     NSData *wrapper = MakeAppAsarWrapper(PatcherPath(), &innerError);
     if (wrapper == nil || ![wrapper writeToFile:AppAsarPath() options:NSDataWritingAtomic error:&innerError]) {
+        DiscordFileOperationFailed = YES;
         if (movedOriginal && ![fm fileExistsAtPath:AppAsarPath()]) {
             [fm moveItemAtPath:BackupAppAsarPath() toPath:AppAsarPath() error:nil];
         }
@@ -688,7 +730,7 @@ static void CloseDiscordIfRunning(void) {
         return;
     }
 
-    LogMessage(@"info", @"Quitting Discord before patching");
+    LogMessage(@"info", @"Quitting Discord before applying Vencord changes");
     for (NSRunningApplication *app in runningDiscordApps) {
         [app terminate];
     }
@@ -705,7 +747,7 @@ static void CloseDiscordIfRunning(void) {
         if (allTerminated) {
             return;
         }
-        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        [NSThread sleepForTimeInterval:0.1];
     }
 
     for (NSRunningApplication *app in runningDiscordApps) {
@@ -749,6 +791,7 @@ static BOOL LaunchDiscord(NSError **error) {
 static BOOL RunLauncher(NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
     LogMessage(@"info", @"Starting at %@", [NSDate date]);
+    ReportStage(@"Checking the Discord installation…", 0.05);
 
     BOOL isDirectory = NO;
     if (![fm fileExistsAtPath:DiscordAppPath() isDirectory:&isDirectory] || !isDirectory) {
@@ -759,17 +802,28 @@ static BOOL RunLauncher(NSError **error) {
         return NO;
     }
 
-    if (IsDiscordPatched()) {
-        LogMessage(@"info", @"Discord is already patched");
-    } else {
+    BOOL discordAlreadyPatched = IsDiscordPatched();
+    if (discordAlreadyPatched && UpdatedVencord) {
+        ReportStage(@"Restarting Discord to load the Vencord update…", 0.80);
         CloseDiscordIfRunning();
+    }
+
+    if (discordAlreadyPatched) {
+        LogMessage(@"info", @"Discord is already patched");
+        ReportStage(@"Discord already has Vencord installed.", 0.82);
+    } else {
+        ReportStage(@"Closing Discord before applying Vencord…", 0.80);
+        CloseDiscordIfRunning();
+        ReportStage(@"Preparing Discord for Vencord…", 0.85);
         if (!PrepareDiscordForPatch(error)) {
             return NO;
         }
         LogMessage(@"info", @"Patching Discord");
+        ReportStage(@"Applying the Vencord patch…", 0.90);
         if (!PatchDiscord(error)) {
             return NO;
         }
+        PatchedDiscord = YES;
     }
 
     if (!IsDiscordPatched()) {
@@ -778,78 +832,207 @@ static BOOL RunLauncher(NSError **error) {
 
     if (ShouldSkipLaunch()) {
         LogMessage(@"info", @"Skipping Discord launch because DISCORD_WITH_VENCORD_SKIP_LAUNCH is set");
+        ReportStage(@"Vencord is ready.", 1.0);
         return YES;
     }
 
     LogMessage(@"info", @"Launching Discord");
-    return LaunchDiscord(error);
+    ReportStage(@"Starting Discord…", 0.96);
+    if (!LaunchDiscord(error)) {
+        return NO;
+    }
+    LaunchedDiscord = YES;
+    ReportStage(@"Vencord is ready and Discord has started.", 1.0);
+    return YES;
+}
+
+static void ShowStatusWindow(void) {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+    NSRect windowFrame = NSMakeRect(0, 0, 440, 150);
+    StatusWindow = [[NSWindow alloc] initWithContentRect:windowFrame
+                                               styleMask:NSWindowStyleMaskTitled
+                                                 backing:NSBackingStoreBuffered
+                                                   defer:NO];
+    StatusWindow.title = @"Discord with Vencord Portable";
+    StatusWindow.releasedWhenClosed = NO;
+
+    NSTextField *heading = [NSTextField labelWithString:@"Preparing Discord with Vencord"];
+    heading.frame = NSMakeRect(24, 98, 392, 24);
+    heading.font = [NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
+    [StatusWindow.contentView addSubview:heading];
+
+    StatusLabel = [NSTextField labelWithString:@"Starting…"];
+    StatusLabel.frame = NSMakeRect(24, 62, 392, 24);
+    StatusLabel.font = [NSFont systemFontOfSize:13];
+    StatusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [StatusWindow.contentView addSubview:StatusLabel];
+
+    StatusProgress = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(24, 34, 392, 12)];
+    StatusProgress.style = NSProgressIndicatorStyleBar;
+    StatusProgress.indeterminate = NO;
+    StatusProgress.minValue = 0.0;
+    StatusProgress.maxValue = 1.0;
+    StatusProgress.doubleValue = 0.0;
+    StatusProgress.accessibilityLabel = @"Launcher progress";
+    [StatusWindow.contentView addSubview:StatusProgress];
+
+    [StatusWindow center];
+    [StatusWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+static void ShowSuccessAlert(void) {
+    [NSApp activateIgnoringOtherApps:YES];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = UsedCachedVencordFallback ? NSAlertStyleWarning : NSAlertStyleInformational;
+    alert.messageText = LaunchedDiscord ? @"Discord is ready" : @"Vencord is ready";
+
+    NSMutableArray<NSString *> *details = [NSMutableArray array];
+    if (UsedCachedVencordFallback) {
+        [details addObject:@"The update check could not finish, so the last complete Vencord cache was used."];
+    } else if (UpdatedVencord) {
+        [details addObject:@"The latest verified Vencord files were installed."];
+    } else {
+        [details addObject:@"No download was needed; recently checked Vencord files were used."];
+    }
+    if (PatchedDiscord) {
+        [details addObject:@"The Vencord patch was applied to Discord."];
+    } else {
+        [details addObject:@"Discord was already configured for Vencord."];
+    }
+    if (LaunchedDiscord) {
+        [details addObject:@"Discord started successfully."];
+    }
+
+    alert.informativeText = [details componentsJoinedByString:@"\n\n"];
+    [alert addButtonWithTitle:@"Done"];
+    [alert runModal];
 }
 
 static void ShowFailureAlert(NSString *details) {
     if (ShouldRunHeadless()) {
-        fprintf(stderr, "Vencord install failed: %s\n", details.UTF8String);
+        fprintf(stderr, "Vencord setup failed: %s\n", details.UTF8String);
         return;
     }
 
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
+
+    BOOL launcherAlreadyRunning =
+        [details rangeOfString:@"already in progress" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    if (launcherAlreadyRunning) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleInformational;
+        alert.messageText = @"Launcher already running";
+        alert.informativeText = @"Another launch is already updating or starting Discord. Wait for it to finish, then try again if Discord does not open.";
+        [alert addButtonWithTitle:@"OK"];
+        [alert runModal];
+        return;
+    }
 
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleCritical;
-    alert.messageText = @"Vencord install failed";
+    alert.messageText = @"Couldn’t prepare Discord";
 
-    BOOL permissionProblem =
+    BOOL permissionProblem = DiscordFileOperationFailed && (
         [details rangeOfString:@"Operation not permitted" options:NSCaseInsensitiveSearch].location != NSNotFound
-        || [details rangeOfString:@"permission" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        || [details rangeOfString:@"permission" options:NSCaseInsensitiveSearch].location != NSNotFound);
+    NSString *logDetails = LogWasOpened
+        ? [NSString stringWithFormat:@"\n\nDetails were written to %@.", LauncherLogPath()]
+        : @"";
 
     if (permissionProblem) {
-        NSURL *settingsURL = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_AppManagement"];
-        if (settingsURL != nil) {
-            [[NSWorkspace sharedWorkspace] openURL:settingsURL];
+        alert.informativeText = [NSString stringWithFormat:
+            @"macOS blocked changes to Discord.app. Open System Settings > Privacy & Security > App Management, enable Discord with Vencord Portable, then try again.%@",
+            logDetails];
+        [alert addButtonWithTitle:@"Open App Management"];
+        [alert addButtonWithTitle:@"Close"];
+        if ([alert runModal] == NSAlertFirstButtonReturn) {
+            NSURL *settingsURL = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_AppManagement"];
+            if (settingsURL != nil) {
+                [[NSWorkspace sharedWorkspace] openURL:settingsURL];
+            }
         }
-        alert.informativeText = @"macOS blocked changes to /Applications/Discord.app.\n\nOpen System Settings > Privacy & Security > App Management, enable Discord with Vencord Portable.app, then run it again.\n\nDetails are in /tmp/vencord-portable-install.log.";
-    } else {
-        alert.informativeText = [NSString stringWithFormat:@"%@\n\nDetails are in /tmp/vencord-portable-install.log.", details];
+        return;
     }
 
+    alert.informativeText = [NSString stringWithFormat:@"%@%@", details, logDetails];
+    [alert addButtonWithTitle:@"Close"];
     [alert runModal];
+}
+
+static BOOL ExecuteLauncher(NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm createDirectoryAtPath:VencordDataDirPath() withIntermediateDirectories:YES attributes:nil error:error]) {
+        return NO;
+    }
+    if (!AcquireLauncherLock(error)) {
+        return NO;
+    }
+    if (!OpenLog(error)) {
+        ReleaseLauncherLock();
+        return NO;
+    }
+
+    BOOL launchSucceeded = RunLauncher(error);
+    if (!launchSucceeded) {
+        NSString *failureDetails = error != NULL ? (*error).localizedDescription : nil;
+        LogMessage(@"error", @"%@", failureDetails.length > 0 ? failureDetails : @"Unknown launcher error");
+    }
+
+    ReleaseLauncherLock();
+    [LogHandle closeFile];
+    LogHandle = nil;
+    return launchSucceeded;
+}
+
+static int RunInteractiveLauncher(void) {
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp finishLaunching];
+    ShowStatusWindow();
+
+    __block BOOL launchSucceeded = NO;
+    __block NSError *launchError = nil;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSError *workerError = nil;
+            BOOL workerSucceeded = ExecuteLauncher(&workerError);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                launchSucceeded = workerSucceeded;
+                launchError = workerError;
+                [NSApp stopModalWithCode:workerSucceeded ? NSModalResponseOK : NSModalResponseAbort];
+            });
+        }
+    });
+
+    [NSApp runModalForWindow:StatusWindow];
+    [StatusWindow orderOut:nil];
+    [StatusWindow close];
+
+    if (!launchSucceeded) {
+        NSString *failureDetails = launchError.localizedDescription;
+        ShowFailureAlert(failureDetails.length > 0 ? failureDetails : @"An unknown error occurred.");
+        return 1;
+    }
+
+    ShowSuccessAlert();
+    return 0;
 }
 
 int main(void) {
     @autoreleasepool {
         if (!ShouldRunHeadless()) {
-            [NSApplication sharedApplication];
+            return RunInteractiveLauncher();
         }
 
         NSError *error = nil;
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm createDirectoryAtPath:VencordDataDirPath() withIntermediateDirectories:YES attributes:nil error:&error]) {
-            ShowFailureAlert(error.localizedDescription);
+        if (!ExecuteLauncher(&error)) {
+            NSString *failureDetails = error.localizedDescription;
+            ShowFailureAlert(failureDetails.length > 0 ? failureDetails : @"An unknown error occurred.");
             return 1;
         }
-
-        if (!AcquireLauncherLock(&error)) {
-            ShowFailureAlert(error.localizedDescription);
-            return 1;
-        }
-
-        if (!OpenLog(&error)) {
-            ReleaseLauncherLock();
-            ShowFailureAlert(error.localizedDescription);
-            return 1;
-        }
-
-        BOOL launchSucceeded = RunLauncher(&error);
-        if (!launchSucceeded) {
-            LogMessage(@"error", @"%@", error.localizedDescription);
-            ReleaseLauncherLock();
-            ShowFailureAlert(error.localizedDescription);
-            return 1;
-        }
-
-        ReleaseLauncherLock();
-        [LogHandle closeFile];
         return 0;
     }
 }

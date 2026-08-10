@@ -23,9 +23,14 @@ if [[ ! -x "$EXECUTABLE" ]]; then
 fi
 
 TEST_ROOT="$(mktemp -d /private/tmp/discord-with-vencord-smoke.XXXXXX)"
+lock_holder_pid=""
 cleanup() {
     local test_status=$?
     trap - EXIT
+    if [[ -n "$lock_holder_pid" ]]; then
+        kill "$lock_holder_pid" 2>/dev/null || true
+        wait "$lock_holder_pid" 2>/dev/null || true
+    fi
     if (( test_status != 0 )) && [[ -f "$TEST_ROOT/launcher.log" ]]; then
         echo "Launcher log from failed smoke test:" >&2
         sed -n '1,240p' "$TEST_ROOT/launcher.log" >&2
@@ -87,6 +92,14 @@ fi
 cmp "$ORIGINAL_ASAR" "$DISCORD_RESOURCES/_app.asar"
 grep -F 'Patching Discord' "$LOG_PATH" >/dev/null
 grep -F 'Skipping Discord launch' "$LOG_PATH" >/dev/null
+grep -F 'Checking the Discord installation' "$LOG_PATH" >/dev/null
+grep -F 'Applying the Vencord patch' "$LOG_PATH" >/dev/null
+if [[ "$MODE" == "--cached" ]]; then
+    grep -F 'Using recently checked Vencord files' "$LOG_PATH" >/dev/null
+else
+    grep -F 'Downloading Vencord (1 of 10)' "$LOG_PATH" >/dev/null
+    grep -F 'Activating the verified Vencord update' "$LOG_PATH" >/dev/null
+fi
 
 for asset in "${assets[@]}"; do
     [[ -s "$VENCORD_DIST/$asset" ]] || {
@@ -97,7 +110,11 @@ done
 [[ -s "$VENCORD_DIST/package.json" ]]
 [[ -s "$VENCORD_DIST/.last-update-check" ]]
 
-force_update=0
+if [[ "$MODE" == "--download" ]]; then
+    force_update=1
+else
+    force_update=0
+fi
 set +e
 DISCORD_APP_PATH="$DISCORD_APP" \
 VENCORD_USER_DATA_DIR="$VENCORD_DATA" \
@@ -118,5 +135,60 @@ fi
 cmp "$ORIGINAL_ASAR" "$DISCORD_RESOURCES/_app.asar"
 grep -F 'Discord is already patched' "$LOG_PATH" >/dev/null
 grep -F 'Skipping Discord launch' "$LOG_PATH" >/dev/null
+grep -F 'Discord already has Vencord installed' "$LOG_PATH" >/dev/null
+grep -F 'Vencord is ready' "$LOG_PATH" >/dev/null
+if [[ "$MODE" == "--download" ]]; then
+    grep -F 'Restarting Discord to load the Vencord update' "$LOG_PATH" >/dev/null
+fi
+
+LOCK_LOG_PATH="$TEST_ROOT/existing-launch.log"
+LOCK_STDERR_PATH="$TEST_ROOT/lock-stderr.log"
+LOCK_HOLDER_STDERR_PATH="$TEST_ROOT/lock-holder-stderr.log"
+LOCK_READY_PATH="$TEST_ROOT/lock-ready"
+touch "$VENCORD_DATA/launcher.lock"
+printf 'existing launcher log\n' >"$LOCK_LOG_PATH"
+setopt no_bg_nice
+(
+    zmodload zsh/system
+    integer held_lock_fd
+    zsystem flock -f held_lock_fd "$VENCORD_DATA/launcher.lock"
+    printf 'ready\n' >"$LOCK_READY_PATH"
+    sleep 30
+) 2>"$LOCK_HOLDER_STDERR_PATH" &
+lock_holder_pid=$!
+
+for attempt in {1..100}; do
+    [[ -f "$LOCK_READY_PATH" ]] && break
+    sleep 0.02
+done
+[[ -f "$LOCK_READY_PATH" ]] || {
+    echo "Could not acquire the smoke-test launcher lock" >&2
+    sed -n '1,80p' "$LOCK_HOLDER_STDERR_PATH" >&2
+    exit 1
+}
+
+set +e
+DISCORD_APP_PATH="$DISCORD_APP" \
+VENCORD_USER_DATA_DIR="$VENCORD_DATA" \
+DISCORD_WITH_VENCORD_LOG_PATH="$LOCK_LOG_PATH" \
+DISCORD_WITH_VENCORD_HEADLESS=1 \
+DISCORD_WITH_VENCORD_SKIP_LAUNCH=1 \
+"$EXECUTABLE" 2>"$LOCK_STDERR_PATH"
+lock_status=$?
+set -e
+
+kill "$lock_holder_pid" 2>/dev/null || true
+wait "$lock_holder_pid" 2>/dev/null || true
+lock_holder_pid=""
+
+(( lock_status != 0 )) || {
+    echo "Concurrent launcher unexpectedly acquired an existing lock" >&2
+    exit 1
+}
+grep -F 'already in progress' "$LOCK_STDERR_PATH" >/dev/null
+[[ "$(<"$LOCK_LOG_PATH")" == "existing launcher log" ]] || {
+    echo "Concurrent launcher modified the existing launch log" >&2
+    exit 1
+}
 
 echo "macOS launcher smoke test passed"
