@@ -13,8 +13,11 @@ readonly zip_path="$root_dir/output/Discord.with.Vencord.Portable.macOS-arm64.zi
 readonly expected_minimum_system_version="12.0"
 readonly expected_bundle_version="0.4.0"
 readonly expected_build_version="7"
-readonly maximum_executable_size_bytes=$((100 * 1024))
-readonly maximum_zip_size_bytes=$((24 * 1024))
+# Apple clang and ld output sizes vary across supported Xcode toolchains. These
+# ceilings keep every build substantially below the v0.3.1 universal baseline
+# (178,320-byte Mach-O and 53,370-byte ZIP) without requiring byte-identical CI.
+readonly maximum_executable_size_bytes=$((112 * 1024))
+readonly maximum_zip_size_bytes=$((32 * 1024))
 
 extraction_dir=""
 
