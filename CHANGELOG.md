@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 - 2026-08-10
+## 0.4.0 - 2026-08-11
 
 - Focus the macOS release on Apple Silicon and remove the Intel `x86_64` slice. Intel users should remain on the v0.3.1 universal release.
 - Reduce the macOS release ZIP from 53,370 bytes to 20,948 bytes, a 60.7% decrease.
